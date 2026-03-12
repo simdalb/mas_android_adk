@@ -12,7 +12,7 @@ except Exception:
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "project": {
-        "name": "LinkNest",
+        "name": "LinkSaver",
         "root_dir": ".",
         "artifacts_dir": "./artifacts",
         "logs_dir": "./logs",
@@ -24,19 +24,24 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "adapter_module": "app_frameworks.kivy_adapter",
     },
     "llm": {
-        "planner_model": "gemini-2.0-flash",
-        "coder_model": "gemini-2.0-flash",
-        "reviewer_model": "gemini-2.0-flash",
-        "documenter_model": "gemini-2.0-flash",
+        "provider_mode": "mixed",
+        "planner_model": "openai:gpt-5.4",
+        "coder_model": "openai:gpt-5.4",
+        "reviewer_model": "google:gemini-3-flash-preview",
+        "documenter_model": "google:gemini-3-flash-preview",
+        "fallback_fast_model": "google:gemini-2.5-flash",
+        "fallback_strong_model": "openai:gpt-5.4",
         "cost_mode": "balanced",
-        "provider": "google_adk",
+        "mock_mode": False,
     },
     "orchestration": {
-        "max_iterations": 3,
-        "max_repair_attempts": 2,
+        "max_iterations": 6,
+        "max_repair_attempts": 3,
         "autonomous_mode": True,
         "require_admin_for_release": True,
         "require_admin_for_internet": True,
+        "stop_on_failed_guardrail": True,
+        "write_iteration_artifacts": True,
     },
     "runtime": {
         "dry_run": True,
@@ -46,10 +51,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "android": {
         "gradle_wrapper_path": "./gradlew",
         "avd_name": "Pixel_6_API_34",
-        "package_name": "com.example.linknest",
+        "package_name": "com.example.linksaver",
+        "min_sdk": 26,
+        "target_sdk": 34,
     },
-    "monetization": {
-        "ads_enabled": True,
+    "app": {
+        "display_name": "LinkSaver",
+        "free_tier_ads": True,
         "paid_tier_enabled": True,
         "trial_days": 7,
     },
@@ -58,6 +66,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "use_firestore": True,
         "use_storage": True,
         "use_auth": True,
+        "offline_cache_enabled": True,
+    },
+    "paths": {
+        "app_dir": "./app",
+        "tests_dir": "./tests",
+        "frameworks_dir": "./app_frameworks",
     },
 }
 

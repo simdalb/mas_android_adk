@@ -1,12 +1,10 @@
 """
 mas_android_adk.py
 
-Initial multi-agent system orchestration skeleton for autonomous Android app
-development in Python, using Google ADK initially.
+Phase-2 multi-agent system orchestration for autonomous Android app development
+in Python, using Google ADK initially behind a replaceable LLM adapter layer.
 
-This file is intentionally designed so it should NOT need modification when the
-future companion modules are created. It imports from not-yet-existing modules
-using stable import points and safe fallbacks.
+This file is designed to remain stable while companion modules evolve.
 """
 
 from __future__ import annotations
@@ -17,9 +15,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import importlib
 import json
-import subprocess
-import sys
-import time
 import traceback
 import uuid
 
@@ -56,7 +51,7 @@ _HOOKS = _import_optional("mas_workflow_hooks")
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "project": {
-        "name": "android-mas-project",
+        "name": "LinkSaver",
         "root_dir": ".",
         "artifacts_dir": "./artifacts",
         "logs_dir": "./logs",
@@ -65,13 +60,16 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "framework": {
         "selected": "kivy",
         "available": ["kivy", "beeware", "flet"],
+        "adapter_module": "app_frameworks.kivy_adapter",
     },
     "llm": {
+        "provider": "google_adk",
         "planner_model": "gemini-2.0-flash",
         "coder_model": "gemini-2.0-flash",
         "reviewer_model": "gemini-2.0-flash",
         "documenter_model": "gemini-2.0-flash",
         "cost_mode": "balanced",
+        "mock_mode": True,
     },
     "orchestration": {
         "max_iterations": 3,
@@ -79,6 +77,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "autonomous_mode": True,
         "require_admin_for_release": True,
         "require_admin_for_internet": True,
+        "stop_on_failed_guardrail": True,
     },
     "runtime": {
         "dry_run": True,
@@ -125,15 +124,15 @@ DEFAULT_HOOKS: Dict[str, Callable[..., None]] = {}
 def _default_guardrail_check(action: str, ctx: "ExecutionContext", payload: Dict[str, Any]) -> Tuple[bool, str]:
     project_root = Path(ctx.project_root).resolve()
 
-    if action in {"write_file", "delete_file", "move_file", "mkdir"}:
+    if action in {"write_file", "delete_file", "move_file", "mkdir", "read_file"}:
         target = payload.get("path")
         if target:
-            try:
-                target_path = Path(target).resolve()
-                if project_root not in [target_path, *target_path.parents]:
-                    return False, f"Path outside project root blocked: {target_path}"
-            except Exception as exc:
-                return False, f"Invalid filesystem path: {exc}"
+            target_path = Path(target)
+            if not target_path.is_absolute():
+                target_path = project_root / target_path
+            target_path = target_path.resolve()
+            if project_root not in [target_path, *target_path.parents]:
+                return False, f"Path outside project root blocked: {target_path}"
 
     if action == "internet_access" and ctx.require_admin_for_internet:
         return False, "Internet access requires administrator approval."
@@ -141,17 +140,25 @@ def _default_guardrail_check(action: str, ctx: "ExecutionContext", payload: Dict
     if action == "modify_environment":
         return False, "Environment modification is blocked by policy."
 
+    if action == "release" and ctx.settings.get("orchestration", {}).get("require_admin_for_release", True):
+        return False, "Release requires administrator approval."
+
     return True, "Allowed by default fallback guardrail."
 
 
 SETTINGS = _get_attr(_SETTINGS, "SETTINGS", DEFAULT_SETTINGS)
 PROMPTS = _get_attr(_PROMPTS, "PROMPTS", DEFAULT_PROMPTS)
+PROMPT_BUILDERS = _get_attr(_PROMPTS, "PROMPT_BUILDERS", {})
 GUARDRAIL_CHECK = _get_attr(_GUARDRAILS, "guardrail_check", _default_guardrail_check)
 TOOL_REGISTRY = _get_attr(_TOOLS, "TOOL_REGISTRY", DEFAULT_TOOL_REGISTRY)
 LLM_REGISTRY = _get_attr(_LLMS, "LLM_REGISTRY", DEFAULT_LLM_REGISTRY)
 POLICIES = _get_attr(_POLICIES, "POLICIES", DEFAULT_POLICIES)
 WORKFLOW_HOOKS = _get_attr(_HOOKS, "WORKFLOW_HOOKS", DEFAULT_HOOKS)
 
+
+# =============================================================================
+# Core types
+# =============================================================================
 
 class AgentType(str, Enum):
     ORCHESTRATOR = "orchestrator"
@@ -190,7 +197,6 @@ class Message:
     subject: str
     content: str
     metadata: Dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -213,6 +219,7 @@ class ExecutionContext:
     policies: Dict[str, Any]
     tool_registry: Dict[str, Any]
     llm_registry: Dict[str, Any]
+    prompt_builders: Dict[str, Callable[..., str]] = field(default_factory=dict)
     artifacts: List[Artifact] = field(default_factory=list)
     messages: List[Message] = field(default_factory=list)
     tasks: Dict[str, Task] = field(default_factory=dict)
@@ -225,6 +232,23 @@ class ExecutionContext:
         if self.verbose:
             print(f"[MAS] {text}")
 
+    def add_artifact(self, artifact: Artifact) -> None:
+        self.artifacts.append(artifact)
+        self.log(f"Artifact registered: {artifact.name} ({artifact.kind})")
+
+    def add_message(self, message: Message) -> None:
+        self.messages.append(message)
+        self.log(f"Message: {message.sender} -> {message.recipient}: {message.subject}")
+
+    def add_task(self, task: Task) -> None:
+        self.tasks[task.task_id] = task
+        self.log(f"Task added: {task.title} [{task.task_id}]")
+
+    def update_task_status(self, task_id: str, status: TaskStatus) -> None:
+        if task_id in self.tasks:
+            self.tasks[task_id].status = status
+            self.log(f"Task updated: {task_id} -> {status.value}")
+
     def get_setting(self, *path: str, default: Any = None) -> Any:
         node: Any = self.settings
         for part in path:
@@ -235,173 +259,19 @@ class ExecutionContext:
                 return default
         return node
 
-
-class ToolError(RuntimeError):
-    pass
-
-
-class BaseTool:
-    name = "base_tool"
-    description = "Base tool"
-
-    def run(self, ctx: ExecutionContext, **kwargs: Any) -> Any:
-        raise NotImplementedError
+    def build_prompt(self, key: str, **kwargs: Any) -> str:
+        builder = self.prompt_builders.get(key)
+        if callable(builder):
+            try:
+                return builder(self, **kwargs)
+            except Exception as exc:
+                self.log(f"Prompt builder failed for {key}: {exc}")
+        return self.prompts.get(key, f"You are {key}.")
 
 
-class SafeSubprocessTool(BaseTool):
-    name = "safe_subprocess"
-    description = "Run whitelisted subprocess commands within project root"
-
-    def run(self, ctx: ExecutionContext, **kwargs: Any) -> Dict[str, Any]:
-        command = kwargs.get("command")
-        cwd = kwargs.get("cwd", ctx.project_root)
-
-        if not command or not isinstance(command, list):
-            raise ToolError("Command must be a list.")
-
-        exe = Path(command[0]).name
-        allowed = set(ctx.policies.get("allowed_subprocess_commands", []))
-        if exe not in allowed:
-            raise ToolError(f"Command not allowed by policy: {exe}")
-
-        ok, reason = GUARDRAIL_CHECK("subprocess", ctx, {"command": command, "cwd": cwd})
-        if not ok:
-            raise ToolError(reason)
-
-        ctx.log(f"Subprocess: {' '.join(command)}")
-
-        if ctx.dry_run:
-            return {"returncode": 0, "stdout": "[dry-run]", "stderr": ""}
-
-        proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
-        return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
-
-
-class FileReadTool(BaseTool):
-    name = "file_read"
-    description = "Read a file within project root"
-
-    def run(self, ctx: ExecutionContext, **kwargs: Any) -> str:
-        path = kwargs["path"]
-        full = Path(path)
-        if not full.is_absolute():
-            full = Path(ctx.project_root) / full
-        return full.read_text(encoding="utf-8")
-
-
-class FileWriteTool(BaseTool):
-    name = "file_write"
-    description = "Write a file within project root"
-
-    def run(self, ctx: ExecutionContext, **kwargs: Any) -> Dict[str, Any]:
-        path = kwargs["path"]
-        content = kwargs.get("content", "")
-        target = Path(path)
-        if not target.is_absolute():
-            target = Path(ctx.project_root) / target
-
-        ok, reason = GUARDRAIL_CHECK("write_file", ctx, {"path": str(target)})
-        if not ok:
-            raise ToolError(reason)
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        if ctx.dry_run:
-            ctx.log(f"[dry-run] write {target}")
-            return {"path": str(target), "written": False, "dry_run": True}
-
-        target.write_text(content, encoding="utf-8")
-        return {"path": str(target), "written": True, "dry_run": False}
-
-
-class GitTool(BaseTool):
-    name = "git"
-    description = "Run git commands"
-
-    def __init__(self) -> None:
-        self.proc = SafeSubprocessTool()
-
-    def run(self, ctx: ExecutionContext, **kwargs: Any) -> Dict[str, Any]:
-        return self.proc.run(ctx, command=["git", *kwargs.get("args", [])], cwd=ctx.project_root)
-
-
-class GradleTool(BaseTool):
-    name = "gradle"
-    description = "Run gradle/gradlew commands"
-
-    def __init__(self) -> None:
-        self.proc = SafeSubprocessTool()
-
-    def run(self, ctx: ExecutionContext, **kwargs: Any) -> Dict[str, Any]:
-        use_wrapper = kwargs.get("use_wrapper", True)
-        exe = "./gradlew" if use_wrapper else "gradle"
-        return self.proc.run(ctx, command=[exe, *kwargs.get("args", [])], cwd=ctx.project_root)
-
-
-class EmulatorTool(BaseTool):
-    name = "emulator"
-    description = "Run adb/emulator commands"
-
-    def __init__(self) -> None:
-        self.proc = SafeSubprocessTool()
-
-    def run(self, ctx: ExecutionContext, **kwargs: Any) -> Dict[str, Any]:
-        mode = kwargs.get("mode", "adb")
-        exe = "adb" if mode == "adb" else "emulator"
-        return self.proc.run(ctx, command=[exe, *kwargs.get("args", [])], cwd=ctx.project_root)
-
-
-class InternetRequestTool(BaseTool):
-    name = "internet_request"
-    description = "Request internet via admin workflow"
-
-    def run(self, ctx: ExecutionContext, **kwargs: Any) -> Dict[str, Any]:
-        purpose = kwargs.get("purpose", "unspecified")
-        ok, reason = GUARDRAIL_CHECK("internet_access", ctx, {"purpose": purpose})
-        return {"approved": ok, "reason": reason, "requires_admin": not ok, "purpose": purpose}
-
-
-BUILTIN_TOOLS: Dict[str, BaseTool] = {
-    "safe_subprocess": SafeSubprocessTool(),
-    "file_read": FileReadTool(),
-    "file_write": FileWriteTool(),
-    "git": GitTool(),
-    "gradle": GradleTool(),
-    "emulator": EmulatorTool(),
-    "internet_request": InternetRequestTool(),
-}
-MERGED_TOOL_REGISTRY: Dict[str, Any] = {**BUILTIN_TOOLS, **TOOL_REGISTRY}
-
-
-class BaseLLM:
-    model_name = "base-llm"
-
-    def generate(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
-        raise NotImplementedError
-
-
-class MockLLM(BaseLLM):
-    model_name = "mock-llm"
-
-    def generate(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
-        return f"[MOCK]\nSYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
-
-
-class GoogleADKLLMAdapter(BaseLLM):
-    def __init__(self, model_name: str = "gemini-2.0-flash") -> None:
-        self.model_name = model_name
-
-    def generate(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
-        return f"[GOOGLE ADK PLACEHOLDER {self.model_name}]\nSYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
-
-
-BUILTIN_LLMS: Dict[str, BaseLLM] = {
-    "mock": MockLLM(),
-    "gemini-2.0-flash": GoogleADKLLMAdapter("gemini-2.0-flash"),
-    "gemini-2.5-pro": GoogleADKLLMAdapter("gemini-2.5-pro"),
-}
-MERGED_LLM_REGISTRY: Dict[str, BaseLLM] = {**BUILTIN_LLMS, **LLM_REGISTRY}
-
+# =============================================================================
+# Agent base
+# =============================================================================
 
 class AgentError(RuntimeError):
     pass
@@ -417,10 +287,10 @@ class Agent:
     llm_name: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def get_prompt(self, ctx: ExecutionContext) -> str:
-        return ctx.prompts.get(self.prompt_key, f"You are {self.name}.")
+    def get_prompt(self, ctx: ExecutionContext, **kwargs: Any) -> str:
+        return ctx.build_prompt(self.prompt_key, agent=self, **kwargs)
 
-    def get_llm(self, ctx: ExecutionContext) -> Optional[BaseLLM]:
+    def get_llm(self, ctx: ExecutionContext):
         if not self.llm_name:
             return None
         return ctx.llm_registry.get(self.llm_name)
@@ -433,12 +303,20 @@ class LLMWorkerAgent(Agent):
     def execute(self, ctx: ExecutionContext, **kwargs: Any) -> Dict[str, Any]:
         llm = self.get_llm(ctx)
         if llm is None:
-            raise AgentError(f"No LLM for {self.name}")
+            raise AgentError(f"No LLM configured for agent {self.name}")
+
+        system_prompt = self.get_prompt(ctx, **kwargs)
+        user_prompt = kwargs.get("user_prompt", "")
+
+        llm_kwargs = dict(kwargs)
+        llm_kwargs.pop("user_prompt", None)
+
         response = llm.generate(
-            system_prompt=self.get_prompt(ctx),
-            user_prompt=kwargs.get("user_prompt", ""),
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            **llm_kwargs,
         )
-        return {"agent": self.name, "response": response}
+        return {"agent": self.name, "response": response, "model": getattr(llm, "model_name", "unknown")}
 
 
 class CustomAgent(Agent):
@@ -448,9 +326,13 @@ class CustomAgent(Agent):
 
     def execute(self, ctx: ExecutionContext, **kwargs: Any) -> Dict[str, Any]:
         if self.handler is None:
-            raise AgentError(f"No handler for {self.name}")
+            raise AgentError(f"No handler configured for custom agent {self.name}")
         return self.handler(ctx=ctx, agent=self, **kwargs)
 
+
+# =============================================================================
+# Workflow base
+# =============================================================================
 
 @dataclass
 class WorkflowResult:
@@ -470,28 +352,42 @@ class BootstrapWorkflow(Workflow):
     name = "bootstrap"
 
     def run(self, ctx: ExecutionContext, agents: Dict[str, Agent], **kwargs: Any) -> WorkflowResult:
+        ctx.log("Starting bootstrap workflow")
         _run_hook("before_bootstrap", ctx)
+
         framework = ctx.get_setting("framework", "selected", default="kivy")
-        project_name = ctx.get_setting("project", "name", default="android-mas-project")
+        project_name = ctx.get_setting("project", "name", default="LinkSaver")
 
         details = {
             "architect": agents["architect"].execute(
                 ctx,
-                user_prompt=f"Design initial MAS and app architecture for {project_name} using selected framework {framework}.",
+                user_prompt=(
+                    f"Design the MAS and Android app architecture for project '{project_name}'. "
+                    f"The selected framework is '{framework}'. Preserve framework portability."
+                ),
             ),
             "framework_selector": agents["framework_selector"].execute(
                 ctx,
-                user_prompt="Explain the framework choice and the abstraction needed to swap frameworks by YAML change.",
+                user_prompt=(
+                    "Confirm the current framework selection and describe the adapter boundary "
+                    "that allows future replacement by YAML configuration."
+                ),
             ),
             "product_manager": agents["product_manager"].execute(
                 ctx,
-                user_prompt="Create an initial backlog for a media-links Android app with auth, sync, ads, subscriptions, and offline support.",
+                user_prompt=(
+                    "Create the initial prioritized backlog and milestone plan for a media links app "
+                    "with authentication, sync, offline support, ads, and subscriptions."
+                ),
             ),
             "documentation_writer": agents["documentation_writer"].execute(
                 ctx,
-                user_prompt="Draft the initial documentation plan for ARCHITECTURE.md and admin HOW-TO guides.",
+                user_prompt=(
+                    "Summarize the documentation deliverables that must exist for developers and the administrator."
+                ),
             ),
         }
+
         ctx.shared_state["bootstrap"] = details
         _run_hook("after_bootstrap", ctx)
         return WorkflowResult(True, "Bootstrap workflow completed", details)
@@ -501,23 +397,38 @@ class DeliveryIterationWorkflow(Workflow):
     name = "delivery_iteration"
 
     def run(self, ctx: ExecutionContext, agents: Dict[str, Agent], **kwargs: Any) -> WorkflowResult:
+        ctx.log("Starting delivery iteration workflow")
         _run_hook("before_delivery_iteration", ctx)
-        scope = kwargs.get("scope", "Implement next backlog item.")
+        scope = kwargs.get("scope", "Implement the next prioritized backlog item.")
+
         details = {
-            "coder": agents["android_coder"].execute(ctx, user_prompt=scope),
+            "coder": agents["android_coder"].execute(
+                ctx,
+                user_prompt=(
+                    f"{scope}\n"
+                    "Respect the framework adapter boundary and keep business logic outside framework-specific code."
+                ),
+            ),
             "tester": agents["test_engineer"].execute(
                 ctx,
-                user_prompt="Create or run unit, integration, and instrumentation test steps for the latest implementation.",
+                user_prompt=(
+                    "Review the current implementation and test plan. Summarize unit, integration, and instrumentation coverage."
+                ),
             ),
             "security": agents["security_reviewer"].execute(
                 ctx,
-                user_prompt="Review the latest changes for privacy, security, secrets handling, and backend rule safety.",
+                user_prompt=(
+                    "Review the current architecture and scaffolding for privacy, security, secrets handling, and Firebase risk."
+                ),
             ),
             "git": agents["git_manager"].execute(
                 ctx,
-                user_prompt="Prepare commit plan and branch summary for the current changes.",
+                user_prompt=(
+                    "Summarize the change set, propose commits, and describe the current repo state expectations."
+                ),
             ),
         }
+
         ctx.shared_state.setdefault("iterations", []).append(details)
         _run_hook("after_delivery_iteration", ctx)
         return WorkflowResult(True, "Delivery iteration completed", details)
@@ -527,29 +438,52 @@ class ReleaseWorkflow(Workflow):
     name = "release"
 
     def run(self, ctx: ExecutionContext, agents: Dict[str, Agent], **kwargs: Any) -> WorkflowResult:
+        ctx.log("Starting release workflow")
         _run_hook("before_release", ctx)
+
         release_packet = agents["release_manager"].execute(
             ctx,
-            user_prompt="Prepare release readiness packet including tests, risks, security summary, and admin decision request.",
+            user_prompt=(
+                "Prepare a release readiness packet with test status, risks, docs status, security status, and rollback notes."
+            ),
         )
-        admin = agents["admin_gateway"].execute(
+
+        admin_result = agents["admin_gateway"].execute(
             ctx,
             action="request_release_decision",
-            payload={"release_packet": release_packet},
+            payload={
+                "release_packet": release_packet,
+                "reason": "Final administrator approval is required before release.",
+            },
         )
-        result = {"release_manager": release_packet, "admin_gateway": admin}
-        ctx.shared_state["release"] = result
-        _run_hook("after_release", ctx)
-        return WorkflowResult(bool(admin.get("approved", False)), "Release workflow completed", result)
 
+        details = {
+            "release_manager": release_packet,
+            "admin_gateway": admin_result,
+        }
+        ctx.shared_state["release"] = details
+
+        _run_hook("after_release", ctx)
+        return WorkflowResult(
+            success=bool(admin_result.get("approved", False)),
+            summary="Release workflow completed",
+            details=details,
+        )
+
+
+# =============================================================================
+# Custom handlers
+# =============================================================================
 
 def orchestrator_handler(ctx: ExecutionContext, agent: Agent, **kwargs: Any) -> Dict[str, Any]:
-    objective = kwargs.get("objective", "Build the Android app.")
+    objective = kwargs.get("objective", "Build and improve the Android app autonomously.")
     max_iterations = int(ctx.get_setting("orchestration", "max_iterations", default=3))
+
     return {
         "agent": agent.name,
         "objective": objective,
         "max_iterations": max_iterations,
+        "framework": ctx.get_setting("framework", "selected", default="kivy"),
         "status": "planned",
     }
 
@@ -557,7 +491,8 @@ def orchestrator_handler(ctx: ExecutionContext, agent: Agent, **kwargs: Any) -> 
 def admin_gateway_handler(ctx: ExecutionContext, agent: Agent, **kwargs: Any) -> Dict[str, Any]:
     action = kwargs.get("action", "request_decision")
     payload = kwargs.get("payload", {})
-    ctx.messages.append(
+
+    ctx.add_message(
         Message(
             sender=agent.name,
             recipient="administrator",
@@ -565,20 +500,38 @@ def admin_gateway_handler(ctx: ExecutionContext, agent: Agent, **kwargs: Any) ->
             content=json.dumps(payload, indent=2, default=str),
         )
     )
+
+    approved = False
+    if action == "request_internet_access":
+        approved = False
+    elif action == "request_release_decision":
+        approved = False
+
     return {
         "agent": agent.name,
         "action": action,
-        "approved": False,
+        "approved": approved,
         "requires_human": True,
         "payload": payload,
     }
 
 
+# =============================================================================
+# Hooks
+# =============================================================================
+
 def _run_hook(name: str, ctx: ExecutionContext) -> None:
     hook = WORKFLOW_HOOKS.get(name)
     if callable(hook):
-        hook(ctx)
+        try:
+            hook(ctx)
+        except Exception as exc:
+            ctx.log(f"Hook {name} failed: {exc}")
 
+
+# =============================================================================
+# Agent factory
+# =============================================================================
 
 def build_agents(ctx: ExecutionContext) -> Dict[str, Agent]:
     planner_model = ctx.get_setting("llm", "planner_model", default="gemini-2.0-flash")
@@ -590,93 +543,97 @@ def build_agents(ctx: ExecutionContext) -> Dict[str, Agent]:
         "orchestrator": CustomAgent(
             name="orchestrator",
             agent_type=AgentType.ORCHESTRATOR,
-            description="Coordinates workflows and execution.",
+            description="Coordinates all workflows and execution.",
             prompt_key="orchestrator",
-            tools=["git", "file_read", "file_write"],
+            tools=["file_read", "file_write", "git_status"],
             handler=orchestrator_handler,
         ),
         "architect": LLMWorkerAgent(
             name="architect",
             agent_type=AgentType.ANALYSIS,
-            description="Designs MAS and app architecture.",
+            description="Designs the MAS and app architecture.",
             prompt_key="architect",
-            tools=["file_read", "file_write"],
+            tools=["file_read", "directory_tree", "settings_view"],
             llm_name=planner_model,
         ),
         "framework_selector": LLMWorkerAgent(
             name="framework_selector",
             agent_type=AgentType.ANALYSIS,
-            description="Selects framework while preserving portability.",
+            description="Confirms framework choice and portability boundaries.",
             prompt_key="framework_selector",
-            tools=["file_read"],
+            tools=["settings_view", "file_read"],
             llm_name=planner_model,
         ),
         "product_manager": LLMWorkerAgent(
             name="product_manager",
             agent_type=AgentType.ANALYSIS,
-            description="Defines backlog and scope.",
+            description="Defines backlog, priorities, and acceptance criteria.",
             prompt_key="product_manager",
-            tools=["file_read", "file_write"],
+            tools=["settings_view", "file_read"],
             llm_name=planner_model,
         ),
         "android_coder": LLMWorkerAgent(
             name="android_coder",
             agent_type=AgentType.CODER,
-            description="Implements app changes.",
+            description="Implements app code, adapters, and integration scaffolding.",
             prompt_key="android_coder",
-            tools=["file_read", "file_write", "git", "gradle"],
+            tools=["file_read", "file_write", "directory_tree", "git_diff", "settings_view"],
             llm_name=coder_model,
         ),
         "test_engineer": LLMWorkerAgent(
             name="test_engineer",
             agent_type=AgentType.TESTER,
-            description="Plans and runs tests.",
+            description="Plans and runs tests, including instrumentation workflows.",
             prompt_key="test_engineer",
-            tools=["file_read", "file_write", "gradle", "emulator"],
+            tools=["pytest_runner", "gradle_tasks", "emulator_status", "file_read"],
             llm_name=reviewer_model,
         ),
         "security_reviewer": LLMWorkerAgent(
             name="security_reviewer",
             agent_type=AgentType.REVIEWER,
-            description="Reviews security and privacy.",
+            description="Reviews secrets handling, access control, privacy, and backend risk.",
             prompt_key="security_reviewer",
-            tools=["file_read"],
+            tools=["file_read", "settings_view", "env_template_view"],
             llm_name=reviewer_model,
         ),
         "documentation_writer": LLMWorkerAgent(
             name="documentation_writer",
             agent_type=AgentType.DOCUMENTATION,
-            description="Writes docs and HOW-TOs.",
+            description="Writes developer docs, admin HOW-TOs, and operational notes.",
             prompt_key="documentation_writer",
-            tools=["file_read", "file_write"],
+            tools=["file_read", "directory_tree", "settings_view"],
             llm_name=documenter_model,
         ),
         "git_manager": LLMWorkerAgent(
             name="git_manager",
             agent_type=AgentType.GIT,
-            description="Manages git workflow.",
+            description="Manages repo status, diffs, commit planning, and release traceability.",
             prompt_key="git_manager",
-            tools=["git", "file_read"],
+            tools=["git_status", "git_diff"],
             llm_name=reviewer_model,
         ),
         "release_manager": LLMWorkerAgent(
             name="release_manager",
             agent_type=AgentType.RELEASE,
-            description="Prepares release evidence and packet.",
+            description="Prepares release evidence and decision packet.",
             prompt_key="release_manager",
-            tools=["file_read", "git", "gradle"],
+            tools=["pytest_runner", "gradle_tasks", "git_status", "file_read"],
             llm_name=reviewer_model,
         ),
         "admin_gateway": CustomAgent(
             name="admin_gateway",
             agent_type=AgentType.ADMIN,
-            description="Requests admin approvals only when needed.",
+            description="Requests only essential human approvals.",
             prompt_key="admin_gateway",
             tools=["internet_request"],
             handler=admin_gateway_handler,
         ),
     }
 
+
+# =============================================================================
+# MAS system
+# =============================================================================
 
 class MultiAgentSystem:
     def __init__(self, ctx: ExecutionContext) -> None:
@@ -689,11 +646,14 @@ class MultiAgentSystem:
         }
 
     def run_workflow(self, workflow_name: str, **kwargs: Any) -> WorkflowResult:
-        workflow = self.workflows[workflow_name]
+        workflow = self.workflows.get(workflow_name)
+        if workflow is None:
+            raise ValueError(f"Unknown workflow: {workflow_name}")
         return workflow.run(self.ctx, self.agents, **kwargs)
 
     def run_full_cycle(self, objective: str) -> Dict[str, Any]:
         results: Dict[str, Any] = {}
+
         results["orchestrator"] = self.agents["orchestrator"].execute(self.ctx, objective=objective)
         results["bootstrap"] = self.run_workflow("bootstrap")
 
@@ -702,7 +662,7 @@ class MultiAgentSystem:
             results.setdefault("iterations", []).append(
                 self.run_workflow(
                     "delivery_iteration",
-                    scope=f"Iteration {i + 1}: implement next prioritized feature or fix.",
+                    scope=f"Iteration {i + 1}: implement the next prioritized feature or fix.",
                 )
             )
 
@@ -710,14 +670,18 @@ class MultiAgentSystem:
         return results
 
 
+# =============================================================================
+# Project helpers
+# =============================================================================
+
 def ensure_directories(ctx: ExecutionContext) -> None:
-    root = Path(ctx.project_root)
+    project_root = Path(ctx.project_root)
     for key in ("artifacts_dir", "logs_dir", "docs_dir"):
-        d = root / Path(ctx.get_setting("project", key, default=f"./{key}"))
+        directory = project_root / Path(ctx.get_setting("project", key, default=f"./{key}"))
         if ctx.dry_run:
-            ctx.log(f"[dry-run] ensure directory {d}")
+            ctx.log(f"[dry-run] ensure directory {directory}")
         else:
-            d.mkdir(parents=True, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True)
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -742,13 +706,18 @@ def make_context(project_root: Optional[str] = None, settings_override: Optional
         settings=settings,
         prompts={**DEFAULT_PROMPTS, **PROMPTS},
         policies={**DEFAULT_POLICIES, **POLICIES},
-        tool_registry=MERGED_TOOL_REGISTRY,
-        llm_registry=MERGED_LLM_REGISTRY,
+        tool_registry=TOOL_REGISTRY,
+        llm_registry=LLM_REGISTRY,
+        prompt_builders=PROMPT_BUILDERS,
         dry_run=bool(settings.get("runtime", {}).get("dry_run", True)),
         verbose=bool(settings.get("runtime", {}).get("verbose", True)),
         require_admin_for_internet=bool(settings.get("orchestration", {}).get("require_admin_for_internet", True)),
     )
 
+
+# =============================================================================
+# CLI
+# =============================================================================
 
 def print_summary(results: Dict[str, Any]) -> None:
     print("\n=== MAS SUMMARY ===")
@@ -762,7 +731,11 @@ def print_summary(results: Dict[str, Any]) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    argv = list(argv or sys.argv[1:])
+    argv = list(argv or [])
+    if not argv:
+        import sys
+        argv = list(sys.argv[1:])
+
     project_root = "."
     dry_run = True
     objective = (

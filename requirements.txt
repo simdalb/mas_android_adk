@@ -1,4 +1,7 @@
 google-adk
+google-genai
+openai
 PyYAML
 python-dotenv
 pytest
+kivy

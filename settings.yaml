@@ -1,5 +1,5 @@
 project:
-  name: "LinkNest"
+  name: "LinkSaver"
   root_dir: "."
   artifacts_dir: "./artifacts"
   logs_dir: "./logs"
@@ -14,19 +14,24 @@ framework:
   adapter_module: "app_frameworks.kivy_adapter"
 
 llm:
-  provider: "google_adk"
-  planner_model: "gemini-2.0-flash"
-  coder_model: "gemini-2.0-flash"
-  reviewer_model: "gemini-2.0-flash"
-  documenter_model: "gemini-2.0-flash"
+  provider_mode: "mixed"
+  planner_model: "openai:gpt-5.4"
+  coder_model: "openai:gpt-5.4"
+  reviewer_model: "google:gemini-3-flash-preview"
+  documenter_model: "google:gemini-3-flash-preview"
+  fallback_fast_model: "google:gemini-2.5-flash"
+  fallback_strong_model: "openai:gpt-5.4"
   cost_mode: "balanced"
+  mock_mode: false
 
 orchestration:
-  max_iterations: 3
-  max_repair_attempts: 2
+  max_iterations: 6
+  max_repair_attempts: 3
   autonomous_mode: true
   require_admin_for_release: true
   require_admin_for_internet: true
+  stop_on_failed_guardrail: true
+  write_iteration_artifacts: true
 
 runtime:
   dry_run: true
@@ -37,9 +42,12 @@ android:
   gradle_wrapper_path: "./gradlew"
   avd_name: "TestDevice34"
   package_name: "com.example.linksaver"
+  min_sdk: 26
+  target_sdk: 34
 
-monetization:
-  ads_enabled: true
+app:
+  display_name: "LinkSaver"
+  free_tier_ads: true
   paid_tier_enabled: true
   trial_days: 7
 
@@ -48,3 +56,9 @@ backend:
   use_firestore: true
   use_storage: true
   use_auth: true
+  offline_cache_enabled: true
+
+paths:
+  app_dir: "./app"
+  tests_dir: "./tests"
+  frameworks_dir: "./app_frameworks"

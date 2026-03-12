@@ -12,16 +12,31 @@ POLICIES = {
         "adb",
         "emulator",
     ],
-    "blocked_paths": [
-        "~",
+    "blocked_path_prefixes": [
         "/",
+        "~",
+    ],
+    "protected_filenames": [
+        ".env",
+        ".env.local",
+    ],
+    "allowed_read_patterns": [
+        "*.py",
+        "*.md",
+        "*.txt",
+        "*.yaml",
+        "*.yml",
+        "*.json",
+        "*.kv",
+        "*.toml",
+        ".env.example",
+        ".gitignore",
     ],
     "secret_env_var_prefixes": [
         "GOOGLE_",
+        "GEMINI_",
         "FIREBASE_",
         "PLAY_",
         "ADMOB_",
-        "OPENAI_",
-        "GEMINI_",
     ],
 }

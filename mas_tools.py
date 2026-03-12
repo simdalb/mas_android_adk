@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 import json
+import os
 import subprocess
+
+from mas_guardrails import guardrail_check
+from mas_settings import SETTINGS
 
 
 class ToolError(RuntimeError):
@@ -20,7 +24,7 @@ class BaseTool:
 
 class SafeSubprocessTool(BaseTool):
     name = "safe_subprocess"
-    description = "Executes whitelisted subprocesses"
+    description = "Runs whitelisted subprocess commands inside the project"
 
     def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
         command = kwargs.get("command")
@@ -29,12 +33,11 @@ class SafeSubprocessTool(BaseTool):
         if not command or not isinstance(command, list):
             raise ToolError("command must be a list")
 
-        exe = Path(command[0]).name
+        executable_name = Path(command[0]).name
         allowed = set(ctx.policies.get("allowed_subprocess_commands", []))
-        if exe not in allowed:
-            raise ToolError(f"command not allowed: {exe}")
+        if executable_name not in allowed:
+            raise ToolError(f"command not allowed: {executable_name}")
 
-        from mas_guardrails import guardrail_check
         ok, reason = guardrail_check("subprocess", ctx, {"command": command, "cwd": cwd})
         if not ok:
             raise ToolError(reason)
@@ -46,7 +49,13 @@ class SafeSubprocessTool(BaseTool):
                 "stderr": "",
             }
 
-        proc = subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
+        proc = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         return {
             "returncode": proc.returncode,
             "stdout": proc.stdout,
@@ -56,11 +65,9 @@ class SafeSubprocessTool(BaseTool):
 
 class FileReadTool(BaseTool):
     name = "file_read"
-    description = "Reads UTF-8 text file"
+    description = "Reads a UTF-8 file inside the project"
 
     def run(self, ctx, **kwargs: Any) -> str:
-        from mas_guardrails import guardrail_check
-
         path = kwargs["path"]
         ok, reason = guardrail_check("read_file", ctx, {"path": path})
         if not ok:
@@ -74,13 +81,12 @@ class FileReadTool(BaseTool):
 
 class FileWriteTool(BaseTool):
     name = "file_write"
-    description = "Writes UTF-8 text file"
+    description = "Writes a UTF-8 file inside the project"
 
     def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
-        from mas_guardrails import guardrail_check
-
         path = kwargs["path"]
         content = kwargs.get("content", "")
+
         ok, reason = guardrail_check("write_file", ctx, {"path": path})
         if not ok:
             raise ToolError(reason)
@@ -99,53 +105,111 @@ class FileWriteTool(BaseTool):
 
 class JsonWriteTool(BaseTool):
     name = "json_write"
-    description = "Writes JSON file"
+    description = "Writes a JSON file inside the project"
 
     def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
         path = kwargs["path"]
         data = kwargs.get("data", {})
-        content = json.dumps(data, indent=2, ensure_ascii=False)
-        return FileWriteTool().run(ctx, path=path, content=content)
+        return FileWriteTool().run(
+            ctx,
+            path=path,
+            content=json.dumps(data, indent=2, ensure_ascii=False),
+        )
+
+
+class SettingsViewTool(BaseTool):
+    name = "settings_view"
+    description = "Returns current merged settings"
+
+    def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        return ctx.settings
+
+
+class EnvTemplateViewTool(BaseTool):
+    name = "env_template_view"
+    description = "Returns the .env.example content if present"
+
+    def run(self, ctx, **kwargs: Any) -> str:
+        env_example = Path(ctx.project_root) / ".env.example"
+        if not env_example.exists():
+            return ""
+        return env_example.read_text(encoding="utf-8")
+
+
+class DirectoryTreeTool(BaseTool):
+    name = "directory_tree"
+    description = "Builds a small text tree of the project structure"
+
+    def run(self, ctx, **kwargs: Any) -> str:
+        root = Path(ctx.project_root)
+        max_depth = int(kwargs.get("max_depth", 3))
+        lines: List[str] = [root.name + "/"]
+
+        def walk(path: Path, depth: int) -> None:
+            if depth > max_depth:
+                return
+            for child in sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
+                rel = child.relative_to(root)
+                indent = "  " * depth
+                suffix = "/" if child.is_dir() else ""
+                lines.append(f"{indent}{rel.name}{suffix}")
+                if child.is_dir():
+                    walk(child, depth + 1)
+
+        walk(root, 1)
+        return "\n".join(lines)
+
+
+class GitStatusTool(BaseTool):
+    name = "git_status"
+    description = "Returns git status"
+
+    def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        return SafeSubprocessTool().run(ctx, command=["git", "status", "--short", "--branch"], cwd=ctx.project_root)
+
+
+class GitDiffTool(BaseTool):
+    name = "git_diff"
+    description = "Returns git diff"
+
+    def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        args = kwargs.get("args", ["--stat"])
+        return SafeSubprocessTool().run(ctx, command=["git", "diff", *args], cwd=ctx.project_root)
 
 
 class GitTool(BaseTool):
     name = "git"
-    description = "Runs git commands"
+    description = "Runs arbitrary git subcommands"
 
     def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
         args = kwargs.get("args", [])
         return SafeSubprocessTool().run(ctx, command=["git", *args], cwd=ctx.project_root)
 
 
-class GradleTool(BaseTool):
-    name = "gradle"
-    description = "Runs gradle wrapper"
+class GradleTasksTool(BaseTool):
+    name = "gradle_tasks"
+    description = "Lists or runs gradle tasks"
 
     def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
-        args = kwargs.get("args", [])
+        args = kwargs.get("args", ["tasks", "--all"])
         use_wrapper = kwargs.get("use_wrapper", True)
         exe = "./gradlew" if use_wrapper else "gradle"
         return SafeSubprocessTool().run(ctx, command=[exe, *args], cwd=ctx.project_root)
 
 
-class EmulatorTool(BaseTool):
-    name = "emulator"
-    description = "Runs adb or emulator command"
+class EmulatorStatusTool(BaseTool):
+    name = "emulator_status"
+    description = "Returns adb devices"
 
     def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
-        mode = kwargs.get("mode", "adb")
-        args = kwargs.get("args", [])
-        exe = "adb" if mode == "adb" else "emulator"
-        return SafeSubprocessTool().run(ctx, command=[exe, *args], cwd=ctx.project_root)
+        return SafeSubprocessTool().run(ctx, command=["adb", "devices"], cwd=ctx.project_root)
 
 
 class InternetRequestTool(BaseTool):
     name = "internet_request"
-    description = "Requests internet access"
+    description = "Checks whether internet access would require admin approval"
 
     def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
-        from mas_guardrails import guardrail_check
-
         purpose = kwargs.get("purpose", "unspecified")
         ok, reason = guardrail_check("internet_access", ctx, {"purpose": purpose})
         return {
@@ -156,13 +220,28 @@ class InternetRequestTool(BaseTool):
         }
 
 
+class PytestRunnerTool(BaseTool):
+    name = "pytest_runner"
+    description = "Runs the Python test suite"
+
+    def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        args = kwargs.get("args", ["-q"])
+        return SafeSubprocessTool().run(ctx, command=["pytest", *args], cwd=ctx.project_root)
+
+
 TOOL_REGISTRY = {
     "safe_subprocess": SafeSubprocessTool(),
     "file_read": FileReadTool(),
     "file_write": FileWriteTool(),
     "json_write": JsonWriteTool(),
+    "settings_view": SettingsViewTool(),
+    "env_template_view": EnvTemplateViewTool(),
+    "directory_tree": DirectoryTreeTool(),
+    "git_status": GitStatusTool(),
+    "git_diff": GitDiffTool(),
     "git": GitTool(),
-    "gradle": GradleTool(),
-    "emulator": EmulatorTool(),
+    "gradle_tasks": GradleTasksTool(),
+    "emulator_status": EmulatorStatusTool(),
     "internet_request": InternetRequestTool(),
+    "pytest_runner": PytestRunnerTool(),
 }

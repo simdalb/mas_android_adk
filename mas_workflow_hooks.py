@@ -5,15 +5,16 @@ import json
 import time
 
 
-def _append_log(ctx, event_name: str) -> None:
+def _append_log(ctx, event_name: str, extra=None) -> None:
     log_dir = Path(ctx.project_root) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    line = {
+    record = {
         "timestamp": time.time(),
         "event": event_name,
+        "extra": extra or {},
     }
     with (log_dir / "workflow_events.jsonl").open("a", encoding="utf-8") as f:
-        f.write(json.dumps(line) + "\n")
+        f.write(json.dumps(record) + "\n")
 
 
 def before_bootstrap(ctx) -> None:
@@ -21,15 +22,15 @@ def before_bootstrap(ctx) -> None:
 
 
 def after_bootstrap(ctx) -> None:
-    _append_log(ctx, "after_bootstrap")
+    _append_log(ctx, "after_bootstrap", {"artifacts": len(ctx.artifacts)})
 
 
 def before_delivery_iteration(ctx) -> None:
-    _append_log(ctx, "before_delivery_iteration")
+    _append_log(ctx, "before_delivery_iteration", {"iterations_so_far": len(ctx.shared_state.get("iterations", []))})
 
 
 def after_delivery_iteration(ctx) -> None:
-    _append_log(ctx, "after_delivery_iteration")
+    _append_log(ctx, "after_delivery_iteration", {"iterations_now": len(ctx.shared_state.get("iterations", []))})
 
 
 def before_release(ctx) -> None:
