@@ -22,7 +22,7 @@ llm:
   fallback_fast_model: "google:gemini-2.5-flash"
   fallback_strong_model: "openai:gpt-5.4"
   cost_mode: "balanced"
-  mock_mode: false
+  mock_mode: true
 
 orchestration:
   max_iterations: 6
@@ -32,6 +32,9 @@ orchestration:
   require_admin_for_internet: true
   stop_on_failed_guardrail: true
   write_iteration_artifacts: true
+  backlog_file: "./artifacts/backlog.json"
+  iteration_reports_dir: "./artifacts/iterations"
+  auto_run_tests: true
 
 runtime:
   dry_run: true

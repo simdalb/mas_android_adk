@@ -42,6 +42,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "require_admin_for_internet": True,
         "stop_on_failed_guardrail": True,
         "write_iteration_artifacts": True,
+        "backlog_file": "./artifacts/backlog.json",
+        "iteration_reports_dir": "./artifacts/iterations",
+        "auto_run_tests": True,
     },
     "runtime": {
         "dry_run": True,

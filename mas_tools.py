@@ -3,11 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
 import json
-import os
 import subprocess
-
-from mas_guardrails import guardrail_check
-from mas_settings import SETTINGS
 
 
 class ToolError(RuntimeError):
@@ -27,6 +23,8 @@ class SafeSubprocessTool(BaseTool):
     description = "Runs whitelisted subprocess commands inside the project"
 
     def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        from mas_guardrails import guardrail_check
+
         command = kwargs.get("command")
         cwd = kwargs.get("cwd", ctx.project_root)
 
@@ -68,6 +66,8 @@ class FileReadTool(BaseTool):
     description = "Reads a UTF-8 file inside the project"
 
     def run(self, ctx, **kwargs: Any) -> str:
+        from mas_guardrails import guardrail_check
+
         path = kwargs["path"]
         ok, reason = guardrail_check("read_file", ctx, {"path": path})
         if not ok:
@@ -84,6 +84,8 @@ class FileWriteTool(BaseTool):
     description = "Writes a UTF-8 file inside the project"
 
     def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        from mas_guardrails import guardrail_check
+
         path = kwargs["path"]
         content = kwargs.get("content", "")
 
@@ -160,6 +162,18 @@ class DirectoryTreeTool(BaseTool):
         return "\n".join(lines)
 
 
+class BacklogViewTool(BaseTool):
+    name = "backlog_view"
+    description = "Returns the current backlog file contents if present"
+
+    def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        backlog_rel = ctx.get_setting("orchestration", "backlog_file", default="./artifacts/backlog.json")
+        backlog_path = Path(ctx.project_root) / Path(backlog_rel)
+        if not backlog_path.exists():
+            return {"items": []}
+        return json.loads(backlog_path.read_text(encoding="utf-8"))
+
+
 class GitStatusTool(BaseTool):
     name = "git_status"
     description = "Returns git status"
@@ -210,6 +224,8 @@ class InternetRequestTool(BaseTool):
     description = "Checks whether internet access would require admin approval"
 
     def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        from mas_guardrails import guardrail_check
+
         purpose = kwargs.get("purpose", "unspecified")
         ok, reason = guardrail_check("internet_access", ctx, {"purpose": purpose})
         return {
@@ -237,6 +253,7 @@ TOOL_REGISTRY = {
     "settings_view": SettingsViewTool(),
     "env_template_view": EnvTemplateViewTool(),
     "directory_tree": DirectoryTreeTool(),
+    "backlog_view": BacklogViewTool(),
     "git_status": GitStatusTool(),
     "git_diff": GitDiffTool(),
     "git": GitTool(),

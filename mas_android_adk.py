@@ -1,15 +1,20 @@
 """
 mas_android_adk.py
 
-Phase-2 multi-agent system orchestration for autonomous Android app development
-in Python, using Google ADK initially behind a replaceable LLM adapter layer.
+Phase-4 multi-agent system orchestration for autonomous Android app development
+in Python.
 
-This file is designed to remain stable while companion modules evolve.
+This phase adds:
+- safe file-writing work execution hooks
+- snapshot/rollback support through mas_autonomy.py
+- file-based admin request / response queue
+- pause/resume friendly autonomous loop
+- CLI support to approve or reject pending admin requests
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -43,6 +48,7 @@ _TOOLS = _import_optional("mas_tools")
 _LLMS = _import_optional("mas_llms")
 _POLICIES = _import_optional("mas_policies")
 _HOOKS = _import_optional("mas_workflow_hooks")
+_AUTONOMY = _import_optional("mas_autonomy")
 
 
 # =============================================================================
@@ -63,21 +69,27 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "adapter_module": "app_frameworks.kivy_adapter",
     },
     "llm": {
-        "provider": "google_adk",
-        "planner_model": "gemini-2.0-flash",
-        "coder_model": "gemini-2.0-flash",
-        "reviewer_model": "gemini-2.0-flash",
-        "documenter_model": "gemini-2.0-flash",
+        "provider_mode": "mixed",
+        "planner_model": "openai:gpt-5.4",
+        "coder_model": "openai:gpt-5.4",
+        "reviewer_model": "google:gemini-3-flash-preview",
+        "documenter_model": "google:gemini-3-flash-preview",
+        "fallback_fast_model": "google:gemini-2.5-flash",
+        "fallback_strong_model": "openai:gpt-5.4",
         "cost_mode": "balanced",
-        "mock_mode": True,
+        "mock_mode": False,
     },
     "orchestration": {
-        "max_iterations": 3,
-        "max_repair_attempts": 2,
+        "max_iterations": 6,
+        "max_repair_attempts": 3,
         "autonomous_mode": True,
         "require_admin_for_release": True,
         "require_admin_for_internet": True,
         "stop_on_failed_guardrail": True,
+        "write_iteration_artifacts": True,
+        "backlog_file": "./artifacts/backlog.json",
+        "iteration_reports_dir": "./artifacts/iterations",
+        "auto_run_tests": True,
     },
     "runtime": {
         "dry_run": True,
@@ -155,6 +167,12 @@ LLM_REGISTRY = _get_attr(_LLMS, "LLM_REGISTRY", DEFAULT_LLM_REGISTRY)
 POLICIES = _get_attr(_POLICIES, "POLICIES", DEFAULT_POLICIES)
 WORKFLOW_HOOKS = _get_attr(_HOOKS, "WORKFLOW_HOOKS", DEFAULT_HOOKS)
 
+AUTONOMY_EXECUTE_WORK_ITEM = _get_attr(_AUTONOMY, "execute_work_item", None)
+AUTONOMY_RESTORE_SNAPSHOT = _get_attr(_AUTONOMY, "restore_snapshot", None)
+AUTONOMY_PENDING_ADMIN_REQUESTS = _get_attr(_AUTONOMY, "pending_admin_requests", None)
+AUTONOMY_REQUEST_ADMIN_APPROVAL = _get_attr(_AUTONOMY, "request_admin_approval", None)
+AUTONOMY_RECORD_ADMIN_RESPONSE = _get_attr(_AUTONOMY, "record_admin_response", None)
+
 
 # =============================================================================
 # Core types
@@ -209,6 +227,31 @@ class Task:
     depends_on: List[str] = field(default_factory=list)
     outputs: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class BacklogItem:
+    item_id: str
+    title: str
+    description: str
+    acceptance_criteria: List[str]
+    status: str = "pending"
+    attempts: int = 0
+    notes: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "BacklogItem":
+        return cls(
+            item_id=str(data["item_id"]),
+            title=str(data["title"]),
+            description=str(data["description"]),
+            acceptance_criteria=list(data.get("acceptance_criteria", [])),
+            status=str(data.get("status", "pending")),
+            attempts=int(data.get("attempts", 0)),
+            notes=list(data.get("notes", [])),
+            metadata=dict(data.get("metadata", {})),
+        )
 
 
 @dataclass
@@ -268,6 +311,30 @@ class ExecutionContext:
                 self.log(f"Prompt builder failed for {key}: {exc}")
         return self.prompts.get(key, f"You are {key}.")
 
+    def resolve_path(self, path_value: str) -> Path:
+        path = Path(path_value)
+        if not path.is_absolute():
+            path = Path(self.project_root) / path
+        return path.resolve()
+
+    def write_json(self, relative_path: str, data: Any) -> Path:
+        target = self.resolve_path(relative_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        return target
+
+    def read_json(self, relative_path: str, default: Any) -> Any:
+        target = self.resolve_path(relative_path)
+        if not target.exists():
+            return default
+        return json.loads(target.read_text(encoding="utf-8"))
+
+    def write_text(self, relative_path: str, text: str) -> Path:
+        target = self.resolve_path(relative_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
 
 # =============================================================================
 # Agent base
@@ -316,7 +383,11 @@ class LLMWorkerAgent(Agent):
             user_prompt=user_prompt,
             **llm_kwargs,
         )
-        return {"agent": self.name, "response": response, "model": getattr(llm, "model_name", "unknown")}
+        return {
+            "agent": self.name,
+            "response": response,
+            "model": getattr(llm, "model_name", "unknown"),
+        }
 
 
 class CustomAgent(Agent):
@@ -369,21 +440,19 @@ class BootstrapWorkflow(Workflow):
             "framework_selector": agents["framework_selector"].execute(
                 ctx,
                 user_prompt=(
-                    "Confirm the current framework selection and describe the adapter boundary "
-                    "that allows future replacement by YAML configuration."
+                    "Confirm the framework selection and explain how the adapter boundary keeps the app swappable."
                 ),
             ),
             "product_manager": agents["product_manager"].execute(
                 ctx,
                 user_prompt=(
-                    "Create the initial prioritized backlog and milestone plan for a media links app "
-                    "with authentication, sync, offline support, ads, and subscriptions."
+                    "Create a local-first backlog for LinkSaver, starting with Kivy CRUD, search, and persistence."
                 ),
             ),
             "documentation_writer": agents["documentation_writer"].execute(
                 ctx,
                 user_prompt=(
-                    "Summarize the documentation deliverables that must exist for developers and the administrator."
+                    "Summarize the docs needed for a developer and the administrator at this phase."
                 ),
             ),
         }
@@ -399,35 +468,43 @@ class DeliveryIterationWorkflow(Workflow):
     def run(self, ctx: ExecutionContext, agents: Dict[str, Agent], **kwargs: Any) -> WorkflowResult:
         ctx.log("Starting delivery iteration workflow")
         _run_hook("before_delivery_iteration", ctx)
+
         scope = kwargs.get("scope", "Implement the next prioritized backlog item.")
+        backlog_item = kwargs.get("backlog_item")
 
         details = {
             "coder": agents["android_coder"].execute(
                 ctx,
                 user_prompt=(
-                    f"{scope}\n"
-                    "Respect the framework adapter boundary and keep business logic outside framework-specific code."
+                    f"Scope:\n{scope}\n\n"
+                    "Summarize implementation intent, files involved, and key constraints."
                 ),
             ),
             "tester": agents["test_engineer"].execute(
                 ctx,
                 user_prompt=(
-                    "Review the current implementation and test plan. Summarize unit, integration, and instrumentation coverage."
+                    "Review current test coverage and summarize how to validate this iteration."
                 ),
             ),
             "security": agents["security_reviewer"].execute(
                 ctx,
                 user_prompt=(
-                    "Review the current architecture and scaffolding for privacy, security, secrets handling, and Firebase risk."
+                    "Review privacy, local storage, key handling, and unintended data exposure risks for this iteration."
                 ),
             ),
             "git": agents["git_manager"].execute(
                 ctx,
                 user_prompt=(
-                    "Summarize the change set, propose commits, and describe the current repo state expectations."
+                    "Summarize expected git changes and recommended commit grouping for this iteration."
                 ),
             ),
+            "backlog_item": asdict(backlog_item) if isinstance(backlog_item, BacklogItem) else None,
         }
+
+        if ctx.get_setting("orchestration", "auto_run_tests", default=True):
+            pytest_runner = ctx.tool_registry.get("pytest_runner")
+            if pytest_runner is not None:
+                details["pytest"] = pytest_runner.run(ctx, args=["-q"])
 
         ctx.shared_state.setdefault("iterations", []).append(details)
         _run_hook("after_delivery_iteration", ctx)
@@ -444,7 +521,7 @@ class ReleaseWorkflow(Workflow):
         release_packet = agents["release_manager"].execute(
             ctx,
             user_prompt=(
-                "Prepare a release readiness packet with test status, risks, docs status, security status, and rollback notes."
+                "Prepare a release readiness packet with test status, security status, open risks, and rollback notes."
             ),
         )
 
@@ -501,16 +578,13 @@ def admin_gateway_handler(ctx: ExecutionContext, agent: Agent, **kwargs: Any) ->
         )
     )
 
-    approved = False
-    if action == "request_internet_access":
-        approved = False
-    elif action == "request_release_decision":
-        approved = False
+    if callable(AUTONOMY_REQUEST_ADMIN_APPROVAL):
+        return AUTONOMY_REQUEST_ADMIN_APPROVAL(ctx, request_type=action, payload=payload)
 
     return {
         "agent": agent.name,
         "action": action,
-        "approved": approved,
+        "approved": False,
         "requires_human": True,
         "payload": payload,
     }
@@ -534,10 +608,10 @@ def _run_hook(name: str, ctx: ExecutionContext) -> None:
 # =============================================================================
 
 def build_agents(ctx: ExecutionContext) -> Dict[str, Agent]:
-    planner_model = ctx.get_setting("llm", "planner_model", default="gemini-2.0-flash")
-    coder_model = ctx.get_setting("llm", "coder_model", default="gemini-2.0-flash")
-    reviewer_model = ctx.get_setting("llm", "reviewer_model", default="gemini-2.0-flash")
-    documenter_model = ctx.get_setting("llm", "documenter_model", default="gemini-2.0-flash")
+    planner_model = ctx.get_setting("llm", "planner_model", default="openai:gpt-5.4")
+    coder_model = ctx.get_setting("llm", "coder_model", default="openai:gpt-5.4")
+    reviewer_model = ctx.get_setting("llm", "reviewer_model", default="google:gemini-3-flash-preview")
+    documenter_model = ctx.get_setting("llm", "documenter_model", default="google:gemini-3-flash-preview")
 
     return {
         "orchestrator": CustomAgent(
@@ -545,7 +619,7 @@ def build_agents(ctx: ExecutionContext) -> Dict[str, Agent]:
             agent_type=AgentType.ORCHESTRATOR,
             description="Coordinates all workflows and execution.",
             prompt_key="orchestrator",
-            tools=["file_read", "file_write", "git_status"],
+            tools=["file_read", "file_write", "git_status", "backlog_view"],
             handler=orchestrator_handler,
         ),
         "architect": LLMWorkerAgent(
@@ -569,7 +643,7 @@ def build_agents(ctx: ExecutionContext) -> Dict[str, Agent]:
             agent_type=AgentType.ANALYSIS,
             description="Defines backlog, priorities, and acceptance criteria.",
             prompt_key="product_manager",
-            tools=["settings_view", "file_read"],
+            tools=["settings_view", "file_read", "backlog_view"],
             llm_name=planner_model,
         ),
         "android_coder": LLMWorkerAgent(
@@ -617,7 +691,7 @@ def build_agents(ctx: ExecutionContext) -> Dict[str, Agent]:
             agent_type=AgentType.RELEASE,
             description="Prepares release evidence and decision packet.",
             prompt_key="release_manager",
-            tools=["pytest_runner", "gradle_tasks", "git_status", "file_read"],
+            tools=["pytest_runner", "gradle_tasks", "git_status", "file_read", "backlog_view"],
             llm_name=reviewer_model,
         ),
         "admin_gateway": CustomAgent(
@@ -653,7 +727,6 @@ class MultiAgentSystem:
 
     def run_full_cycle(self, objective: str) -> Dict[str, Any]:
         results: Dict[str, Any] = {}
-
         results["orchestrator"] = self.agents["orchestrator"].execute(self.ctx, objective=objective)
         results["bootstrap"] = self.run_workflow("bootstrap")
 
@@ -669,6 +742,189 @@ class MultiAgentSystem:
         results["release"] = self.run_workflow("release")
         return results
 
+    def backlog_file_path(self) -> str:
+        return self.ctx.get_setting("orchestration", "backlog_file", default="./artifacts/backlog.json")
+
+    def iteration_reports_dir(self) -> str:
+        return self.ctx.get_setting("orchestration", "iteration_reports_dir", default="./artifacts/iterations")
+
+    def default_backlog(self) -> List[BacklogItem]:
+        return [
+            BacklogItem(
+                item_id="use-cases-001",
+                title="Add media link use-case layer",
+                description="Create a framework-agnostic use-case layer for CRUD and search over media links.",
+                acceptance_criteria=[
+                    "Use-case module exists",
+                    "It wraps repository CRUD operations",
+                    "It is independent of the UI framework",
+                ],
+                metadata={"executor": "create_media_link_use_cases"},
+            ),
+            BacklogItem(
+                item_id="use-cases-tests-001",
+                title="Add use-case tests",
+                description="Create tests for the media link use-case layer.",
+                acceptance_criteria=[
+                    "Use-case tests exist",
+                    "Tests pass under pytest",
+                ],
+                metadata={"executor": "create_media_link_use_case_tests"},
+            ),
+            BacklogItem(
+                item_id="autonomy-docs-001",
+                title="Write autonomous mode runbook",
+                description="Create documentation explaining autonomous runs, approvals, pause/resume, and artifacts.",
+                acceptance_criteria=[
+                    "Runbook exists",
+                    "Approval queue is explained",
+                    "Resume process is explained",
+                ],
+                metadata={"executor": "create_autonomy_runbook"},
+            ),
+        ]
+
+    def load_backlog(self) -> List[BacklogItem]:
+        raw = self.ctx.read_json(self.backlog_file_path(), default=None)
+        if not raw:
+            backlog = self.default_backlog()
+            self.save_backlog(backlog)
+            return backlog
+        return [BacklogItem.from_dict(item) for item in raw]
+
+    def save_backlog(self, items: List[BacklogItem]) -> None:
+        self.ctx.write_json(self.backlog_file_path(), [asdict(item) for item in items])
+
+    def next_pending_backlog_item(self, items: List[BacklogItem]) -> Optional[BacklogItem]:
+        for item in items:
+            if item.status == "pending":
+                return item
+        return None
+
+    def write_iteration_report(self, iteration_number: int, payload: Dict[str, Any]) -> Path:
+        rel = f"{self.iteration_reports_dir().rstrip('/')}/iteration_{iteration_number:03d}.json"
+        return self.ctx.write_json(rel, payload)
+
+    def _pending_admin_requests(self) -> List[Dict[str, Any]]:
+        if callable(AUTONOMY_PENDING_ADMIN_REQUESTS):
+            return AUTONOMY_PENDING_ADMIN_REQUESTS(self.ctx)
+        return []
+
+    def _execute_backlog_item_work(self, item: BacklogItem) -> Dict[str, Any]:
+        if not callable(AUTONOMY_EXECUTE_WORK_ITEM):
+            return {"success": False, "summary": "No autonomy executor available", "changed_files": []}
+        return AUTONOMY_EXECUTE_WORK_ITEM(self.ctx, item)
+
+    def _restore_snapshot(self, snapshot_manifest_path: Optional[str]) -> None:
+        if snapshot_manifest_path and callable(AUTONOMY_RESTORE_SNAPSHOT):
+            AUTONOMY_RESTORE_SNAPSHOT(self.ctx, snapshot_manifest_path)
+
+    def run_autonomous_development_loop(self, objective: str) -> Dict[str, Any]:
+        self.ctx.log("Starting autonomous development loop")
+        summary: Dict[str, Any] = {
+            "objective": objective,
+            "bootstrap": None,
+            "iterations": [],
+            "release": None,
+            "status": "running",
+        }
+
+        pending = self._pending_admin_requests()
+        if pending:
+            summary["status"] = "paused_waiting_admin"
+            summary["pending_admin_requests"] = pending
+            return summary
+
+        summary["orchestrator"] = self.agents["orchestrator"].execute(self.ctx, objective=objective)
+        summary["bootstrap"] = self.run_workflow("bootstrap")
+
+        backlog = self.load_backlog()
+        max_iterations = int(self.ctx.get_setting("orchestration", "max_iterations", default=3))
+        max_repair_attempts = int(self.ctx.get_setting("orchestration", "max_repair_attempts", default=2))
+
+        for iteration_number in range(1, max_iterations + 1):
+            pending = self._pending_admin_requests()
+            if pending:
+                summary["status"] = "paused_waiting_admin"
+                summary["pending_admin_requests"] = pending
+                break
+
+            backlog = self.load_backlog()
+            item = self.next_pending_backlog_item(backlog)
+            if item is None:
+                self.ctx.log("No pending backlog items remain")
+                summary["status"] = "completed_backlog"
+                break
+
+            item.status = "active"
+            item.attempts += 1
+            self.save_backlog(backlog)
+
+            work_result = self._execute_backlog_item_work(item)
+
+            scope = (
+                f"{item.title}\n\n"
+                f"{item.description}\n\n"
+                "Acceptance criteria:\n- " + "\n- ".join(item.acceptance_criteria)
+            )
+            result = self.run_workflow("delivery_iteration", scope=scope, backlog_item=item)
+
+            pytest_result = result.details.get("pytest", {})
+            tests_ok = bool(pytest_result.get("returncode", 0) == 0)
+
+            if tests_ok and work_result.get("success", False):
+                item.status = "done"
+                item.notes.append(f"Iteration {iteration_number}: work executed and tests passed")
+            else:
+                snapshot_manifest = work_result.get("snapshot_manifest")
+                if snapshot_manifest:
+                    self._restore_snapshot(snapshot_manifest)
+
+                if item.attempts >= max_repair_attempts:
+                    item.status = "failed"
+                    item.notes.append(
+                        f"Iteration {iteration_number}: failed after max attempts; rolled back latest snapshot"
+                    )
+                else:
+                    item.status = "pending"
+                    item.notes.append(
+                        f"Iteration {iteration_number}: failed or tests did not pass; rolled back and returned to backlog"
+                    )
+
+            self.save_backlog(backlog)
+
+            payload = {
+                "iteration_number": iteration_number,
+                "backlog_item": asdict(item),
+                "work_result": work_result,
+                "workflow_result": {
+                    "success": result.success,
+                    "summary": result.summary,
+                    "details": result.details,
+                },
+                "tests_ok": tests_ok,
+            }
+            report_path = self.write_iteration_report(iteration_number, payload)
+            self.ctx.add_artifact(
+                Artifact(
+                    name=f"iteration_{iteration_number:03d}_report",
+                    path=str(report_path),
+                    kind="iteration_report",
+                    created_by="orchestrator",
+                    metadata={"iteration_number": iteration_number, "tests_ok": tests_ok},
+                )
+            )
+            summary["iterations"].append(payload)
+
+        if summary.get("status") not in {"paused_waiting_admin"}:
+            summary["release"] = self.run_workflow("release")
+            if summary["release"].details.get("admin_gateway", {}).get("status") == "pending":
+                summary["status"] = "paused_waiting_admin"
+            else:
+                summary["status"] = summary.get("status", "finished")
+
+        return summary
+
 
 # =============================================================================
 # Project helpers
@@ -678,6 +934,19 @@ def ensure_directories(ctx: ExecutionContext) -> None:
     project_root = Path(ctx.project_root)
     for key in ("artifacts_dir", "logs_dir", "docs_dir"):
         directory = project_root / Path(ctx.get_setting("project", key, default=f"./{key}"))
+        if ctx.dry_run:
+            ctx.log(f"[dry-run] ensure directory {directory}")
+        else:
+            directory.mkdir(parents=True, exist_ok=True)
+
+    extra_dirs = [
+        ctx.get_setting("orchestration", "iteration_reports_dir", default="./artifacts/iterations"),
+        "./artifacts/admin/requests",
+        "./artifacts/admin/responses",
+        "./artifacts/snapshots",
+    ]
+    for rel in extra_dirs:
+        directory = project_root / Path(rel)
         if ctx.dry_run:
             ctx.log(f"[dry-run] ensure directory {directory}")
         else:
@@ -738,10 +1007,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     project_root = "."
     dry_run = True
+    autonomous = False
     objective = (
         "Autonomously develop a high-quality Android app in Python for saving, "
         "organizing, sharing, and accessing remote and local media links."
     )
+    approve_request_id: Optional[str] = None
+    decision: Optional[str] = None
+    note = ""
 
     i = 0
     while i < len(argv):
@@ -752,8 +1025,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif arg == "--real-run":
             dry_run = False
             i += 1
+        elif arg == "--autonomous":
+            autonomous = True
+            i += 1
         elif arg == "--objective" and i + 1 < len(argv):
             objective = argv[i + 1]
+            i += 2
+        elif arg == "--approve-request" and i + 1 < len(argv):
+            approve_request_id = argv[i + 1]
+            i += 2
+        elif arg == "--decision" and i + 1 < len(argv):
+            decision = argv[i + 1].strip().lower()
+            i += 2
+        elif arg == "--note" and i + 1 < len(argv):
+            note = argv[i + 1]
             i += 2
         else:
             print(f"Unknown argument: {arg}")
@@ -764,8 +1049,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         ensure_directories(ctx)
+
+        if approve_request_id:
+            if not callable(AUTONOMY_RECORD_ADMIN_RESPONSE):
+                print("Approval recording is not available.")
+                return 1
+            if decision not in {"approved", "rejected"}:
+                print("Use --decision approved or --decision rejected")
+                return 2
+            payload = AUTONOMY_RECORD_ADMIN_RESPONSE(
+                ctx,
+                request_id=approve_request_id,
+                approved=(decision == "approved"),
+                note=note,
+            )
+            print(json.dumps(payload, indent=2))
+            return 0
+
         mas = MultiAgentSystem(ctx)
-        results = mas.run_full_cycle(objective=objective)
+        if autonomous:
+            results = mas.run_autonomous_development_loop(objective=objective)
+        else:
+            results = mas.run_full_cycle(objective=objective)
         print_summary(results)
         return 0
     except Exception as exc:

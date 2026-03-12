@@ -24,7 +24,7 @@ def build_demo_links() -> List[MediaLink]:
     if links:
         return links
 
-    return [
+    sample = [
         MediaLink(
             title="Sample remote video",
             url="https://example.com/video/123",
@@ -39,6 +39,8 @@ def build_demo_links() -> List[MediaLink]:
             description="Example local media path",
         ),
     ]
+    repo.save_all(sample)
+    return sample
 
 
 def main() -> int:
