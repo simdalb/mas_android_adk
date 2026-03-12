@@ -1,0 +1,50 @@
+project:
+  name: "LinkNest"
+  root_dir: "."
+  artifacts_dir: "./artifacts"
+  logs_dir: "./logs"
+  docs_dir: "./docs"
+
+framework:
+  selected: "kivy"
+  available:
+    - "kivy"
+    - "beeware"
+    - "flet"
+  adapter_module: "app_frameworks.kivy_adapter"
+
+llm:
+  provider: "google_adk"
+  planner_model: "gemini-2.0-flash"
+  coder_model: "gemini-2.0-flash"
+  reviewer_model: "gemini-2.0-flash"
+  documenter_model: "gemini-2.0-flash"
+  cost_mode: "balanced"
+
+orchestration:
+  max_iterations: 3
+  max_repair_attempts: 2
+  autonomous_mode: true
+  require_admin_for_release: true
+  require_admin_for_internet: true
+
+runtime:
+  dry_run: true
+  verbose: true
+  fail_fast: false
+
+android:
+  gradle_wrapper_path: "./gradlew"
+  avd_name: "TestDevice34"
+  package_name: "com.example.linksaver"
+
+monetization:
+  ads_enabled: true
+  paid_tier_enabled: true
+  trial_days: 7
+
+backend:
+  firebase_enabled: true
+  use_firestore: true
+  use_storage: true
+  use_auth: true
