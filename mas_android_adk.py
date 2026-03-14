@@ -1,15 +1,13 @@
 """
 mas_android_adk.py
 
-Phase-4 multi-agent system orchestration for autonomous Android app development
+Phase-7 multi-agent system orchestration for autonomous Android app development
 in Python.
 
 This phase adds:
-- safe file-writing work execution hooks
-- snapshot/rollback support through mas_autonomy.py
-- file-based admin request / response queue
-- pause/resume friendly autonomous loop
-- CLI support to approve or reject pending admin requests
+- failure-aware repair context in the autonomous loop
+- a second controlled llm_patch backlog item for app validation UX
+- persistent failure summaries for retries
 """
 
 from __future__ import annotations
@@ -20,13 +18,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import importlib
 import json
+import time
 import traceback
 import uuid
 
-
-# =============================================================================
-# Dynamic import helpers
-# =============================================================================
 
 def _import_optional(module_name: str) -> Optional[Any]:
     try:
@@ -50,10 +45,6 @@ _POLICIES = _import_optional("mas_policies")
 _HOOKS = _import_optional("mas_workflow_hooks")
 _AUTONOMY = _import_optional("mas_autonomy")
 
-
-# =============================================================================
-# Defaults and fallbacks
-# =============================================================================
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "project": {
@@ -89,7 +80,16 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "write_iteration_artifacts": True,
         "backlog_file": "./artifacts/backlog.json",
         "iteration_reports_dir": "./artifacts/iterations",
+        "plan_artifacts_dir": "./artifacts/plans",
+        "run_state_file": "./artifacts/run_state.json",
         "auto_run_tests": True,
+        "auto_build_android": False,
+        "auto_smoke_test_android": False,
+        "app_spec_file": "./artifacts/app_spec.json",
+    },
+    "android": {
+        "package_name": "com.example.linksaver",
+        "smoke_test_package_name": "com.example.linksaver",
     },
     "runtime": {
         "dry_run": True,
@@ -125,6 +125,9 @@ DEFAULT_POLICIES: Dict[str, Any] = {
         "gradlew",
         "adb",
         "emulator",
+        "buildozer",
+        "python3",
+        "python.exe",
     ],
 }
 
@@ -173,10 +176,6 @@ AUTONOMY_PENDING_ADMIN_REQUESTS = _get_attr(_AUTONOMY, "pending_admin_requests",
 AUTONOMY_REQUEST_ADMIN_APPROVAL = _get_attr(_AUTONOMY, "request_admin_approval", None)
 AUTONOMY_RECORD_ADMIN_RESPONSE = _get_attr(_AUTONOMY, "record_admin_response", None)
 
-
-# =============================================================================
-# Core types
-# =============================================================================
 
 class AgentType(str, Enum):
     ORCHESTRATOR = "orchestrator"
@@ -336,10 +335,6 @@ class ExecutionContext:
         return target
 
 
-# =============================================================================
-# Agent base
-# =============================================================================
-
 class AgentError(RuntimeError):
     pass
 
@@ -400,10 +395,6 @@ class CustomAgent(Agent):
             raise AgentError(f"No handler configured for custom agent {self.name}")
         return self.handler(ctx=ctx, agent=self, **kwargs)
 
-
-# =============================================================================
-# Workflow base
-# =============================================================================
 
 @dataclass
 class WorkflowResult:
@@ -548,10 +539,6 @@ class ReleaseWorkflow(Workflow):
         )
 
 
-# =============================================================================
-# Custom handlers
-# =============================================================================
-
 def orchestrator_handler(ctx: ExecutionContext, agent: Agent, **kwargs: Any) -> Dict[str, Any]:
     objective = kwargs.get("objective", "Build and improve the Android app autonomously.")
     max_iterations = int(ctx.get_setting("orchestration", "max_iterations", default=3))
@@ -590,10 +577,6 @@ def admin_gateway_handler(ctx: ExecutionContext, agent: Agent, **kwargs: Any) ->
     }
 
 
-# =============================================================================
-# Hooks
-# =============================================================================
-
 def _run_hook(name: str, ctx: ExecutionContext) -> None:
     hook = WORKFLOW_HOOKS.get(name)
     if callable(hook):
@@ -602,10 +585,6 @@ def _run_hook(name: str, ctx: ExecutionContext) -> None:
         except Exception as exc:
             ctx.log(f"Hook {name} failed: {exc}")
 
-
-# =============================================================================
-# Agent factory
-# =============================================================================
 
 def build_agents(ctx: ExecutionContext) -> Dict[str, Agent]:
     planner_model = ctx.get_setting("llm", "planner_model", default="openai:gpt-5.4")
@@ -705,10 +684,6 @@ def build_agents(ctx: ExecutionContext) -> Dict[str, Agent]:
     }
 
 
-# =============================================================================
-# MAS system
-# =============================================================================
-
 class MultiAgentSystem:
     def __init__(self, ctx: ExecutionContext) -> None:
         self.ctx = ctx
@@ -748,6 +723,9 @@ class MultiAgentSystem:
     def iteration_reports_dir(self) -> str:
         return self.ctx.get_setting("orchestration", "iteration_reports_dir", default="./artifacts/iterations")
 
+    def run_state_file_path(self) -> str:
+        return self.ctx.get_setting("orchestration", "run_state_file", default="./artifacts/run_state.json")
+
     def default_backlog(self) -> List[BacklogItem]:
         return [
             BacklogItem(
@@ -772,6 +750,17 @@ class MultiAgentSystem:
                 metadata={"executor": "create_media_link_use_case_tests"},
             ),
             BacklogItem(
+                item_id="kivy-use-cases-001",
+                title="Switch Kivy adapter to use use-case layer",
+                description="Move Kivy CRUD UI off direct repository calls and onto the framework-agnostic use-case layer.",
+                acceptance_criteria=[
+                    "Kivy adapter imports use-case layer",
+                    "Kivy CRUD operations go through use cases",
+                    "Tests still pass",
+                ],
+                metadata={"executor": "switch_kivy_to_use_cases"},
+            ),
+            BacklogItem(
                 item_id="autonomy-docs-001",
                 title="Write autonomous mode runbook",
                 description="Create documentation explaining autonomous runs, approvals, pause/resume, and artifacts.",
@@ -781,6 +770,46 @@ class MultiAgentSystem:
                     "Resume process is explained",
                 ],
                 metadata={"executor": "create_autonomy_runbook"},
+            ),
+            BacklogItem(
+                item_id="autonomy-status-docs-001",
+                title="Document status inspection",
+                description="Add run-state status inspection to autonomous mode docs.",
+                acceptance_criteria=[
+                    "Status command documented",
+                ],
+                metadata={"executor": "document_status_command"},
+            ),
+            BacklogItem(
+                item_id="llm-patch-docs-001",
+                title="Improve autonomous mode documentation with troubleshooting note",
+                description="Use the guarded llm_patch path to add a short troubleshooting note to autonomous mode documentation.",
+                acceptance_criteria=[
+                    "The autonomous mode doc includes a troubleshooting section",
+                    "The change is applied through llm_patch",
+                    "Tests still pass",
+                ],
+                metadata={
+                    "executor": "llm_patch",
+                    "patch_target_hint": ["docs/AUTONOMOUS_MODE.md"],
+                },
+            ),
+            BacklogItem(
+                item_id="llm-patch-ui-001",
+                title="Improve UI validation guidance",
+                description="Use the guarded llm_patch path to improve Kivy UI validation messages and add a duplicate warning hint.",
+                acceptance_criteria=[
+                    "Validation failures are clearer to the user",
+                    "The Kivy UI contains a duplicate guidance message",
+                    "Tests still pass",
+                ],
+                metadata={
+                    "executor": "llm_patch",
+                    "patch_target_hint": [
+                        "app/use_cases/media_links.py",
+                        "app_frameworks/kivy_adapter.py",
+                    ],
+                },
             ),
         ]
 
@@ -794,6 +823,25 @@ class MultiAgentSystem:
 
     def save_backlog(self, items: List[BacklogItem]) -> None:
         self.ctx.write_json(self.backlog_file_path(), [asdict(item) for item in items])
+
+    def load_run_state(self) -> Dict[str, Any]:
+        return self.ctx.read_json(
+            self.run_state_file_path(),
+            default={
+                "status": "not_started",
+                "objective": "",
+                "updated_at": None,
+                "current_iteration": 0,
+                "current_backlog_item": None,
+                "last_iteration_report": None,
+                "pending_admin_requests": [],
+            },
+        )
+
+    def save_run_state(self, payload: Dict[str, Any]) -> Path:
+        payload = dict(payload)
+        payload["updated_at"] = time.time()
+        return self.ctx.write_json(self.run_state_file_path(), payload)
 
     def next_pending_backlog_item(self, items: List[BacklogItem]) -> Optional[BacklogItem]:
         for item in items:
@@ -813,11 +861,51 @@ class MultiAgentSystem:
     def _execute_backlog_item_work(self, item: BacklogItem) -> Dict[str, Any]:
         if not callable(AUTONOMY_EXECUTE_WORK_ITEM):
             return {"success": False, "summary": "No autonomy executor available", "changed_files": []}
-        return AUTONOMY_EXECUTE_WORK_ITEM(self.ctx, item)
+        return AUTONOMY_EXECUTE_WORK_ITEM(self.ctx, item, agents=self.agents)
 
     def _restore_snapshot(self, snapshot_manifest_path: Optional[str]) -> None:
         if snapshot_manifest_path and callable(AUTONOMY_RESTORE_SNAPSHOT):
             AUTONOMY_RESTORE_SNAPSHOT(self.ctx, snapshot_manifest_path)
+
+    def _short_failure_summary(self, pytest_result: Dict[str, Any]) -> str:
+        stdout = str(pytest_result.get("stdout", "")).strip()
+        stderr = str(pytest_result.get("stderr", "")).strip()
+        combined = "\n".join(part for part in [stdout, stderr] if part).strip()
+        if not combined:
+            return "Tests failed with no output."
+        lines = [line.rstrip() for line in combined.splitlines() if line.strip()]
+        return "\n".join(lines[-20:])
+
+    def _build_or_smoke_failure_summary(self, result: Dict[str, Any], default_message: str) -> str:
+        stdout = str(result.get("stdout", "")).strip()
+        stderr = str(result.get("stderr", "")).strip()
+        try:
+            payload = json.loads(stdout) if stdout.startswith("{") else {}
+        except Exception:
+            payload = {}
+        report_errors = payload.get("errors", []) if isinstance(payload, dict) else []
+        pieces = [part for part in [stderr, "\n".join(report_errors), stdout] if part]
+        combined = "\n".join(pieces).strip()
+        if not combined:
+            return default_message
+        lines = [line.rstrip() for line in combined.splitlines() if line.strip()]
+        return "\n".join(lines[-25:])
+
+    def _run_android_validation(self) -> Dict[str, Any]:
+        validation: Dict[str, Any] = {"build": None, "smoke_test": None, "ok": True}
+        if self.ctx.get_setting("orchestration", "auto_build_android", default=False):
+            build_result = self.ctx.tool_registry["android_build"].run(self.ctx, mode="debug", dry_run=self.ctx.dry_run)
+            validation["build"] = build_result
+            validation["ok"] = validation["ok"] and build_result.get("returncode", 1) == 0
+            if validation["ok"] and self.ctx.get_setting("orchestration", "auto_smoke_test_android", default=False):
+                smoke_result = self.ctx.tool_registry["android_smoke_test"].run(
+                    self.ctx,
+                    package_name=self.ctx.get_setting("android", "smoke_test_package_name", default=self.ctx.get_setting("android", "package_name", default="com.example.linksaver")),
+                    dry_run=self.ctx.dry_run,
+                )
+                validation["smoke_test"] = smoke_result
+                validation["ok"] = validation["ok"] and smoke_result.get("returncode", 1) == 0
+        return validation
 
     def run_autonomous_development_loop(self, objective: str) -> Dict[str, Any]:
         self.ctx.log("Starting autonomous development loop")
@@ -833,12 +921,22 @@ class MultiAgentSystem:
         if pending:
             summary["status"] = "paused_waiting_admin"
             summary["pending_admin_requests"] = pending
+            self.save_run_state(summary)
             return summary
 
         summary["orchestrator"] = self.agents["orchestrator"].execute(self.ctx, objective=objective)
         summary["bootstrap"] = self.run_workflow("bootstrap")
+        self.save_run_state(
+            {
+                "status": "running",
+                "objective": objective,
+                "current_iteration": 0,
+                "current_backlog_item": None,
+                "last_iteration_report": None,
+                "pending_admin_requests": [],
+            }
+        )
 
-        backlog = self.load_backlog()
         max_iterations = int(self.ctx.get_setting("orchestration", "max_iterations", default=3))
         max_repair_attempts = int(self.ctx.get_setting("orchestration", "max_repair_attempts", default=2))
 
@@ -847,6 +945,16 @@ class MultiAgentSystem:
             if pending:
                 summary["status"] = "paused_waiting_admin"
                 summary["pending_admin_requests"] = pending
+                self.save_run_state(
+                    {
+                        "status": "paused_waiting_admin",
+                        "objective": objective,
+                        "current_iteration": iteration_number - 1,
+                        "current_backlog_item": None,
+                        "last_iteration_report": summary["iterations"][-1]["report_path"] if summary["iterations"] else None,
+                        "pending_admin_requests": pending,
+                    }
+                )
                 break
 
             backlog = self.load_backlog()
@@ -854,11 +962,32 @@ class MultiAgentSystem:
             if item is None:
                 self.ctx.log("No pending backlog items remain")
                 summary["status"] = "completed_backlog"
+                self.save_run_state(
+                    {
+                        "status": "completed_backlog",
+                        "objective": objective,
+                        "current_iteration": iteration_number - 1,
+                        "current_backlog_item": None,
+                        "last_iteration_report": summary["iterations"][-1]["report_path"] if summary["iterations"] else None,
+                        "pending_admin_requests": [],
+                    }
+                )
                 break
 
             item.status = "active"
             item.attempts += 1
             self.save_backlog(backlog)
+
+            self.save_run_state(
+                {
+                    "status": "running",
+                    "objective": objective,
+                    "current_iteration": iteration_number,
+                    "current_backlog_item": asdict(item),
+                    "last_iteration_report": summary["iterations"][-1]["report_path"] if summary["iterations"] else None,
+                    "pending_admin_requests": [],
+                }
+            )
 
             work_result = self._execute_backlog_item_work(item)
 
@@ -871,14 +1000,27 @@ class MultiAgentSystem:
 
             pytest_result = result.details.get("pytest", {})
             tests_ok = bool(pytest_result.get("returncode", 0) == 0)
+            android_validation = self._run_android_validation() if tests_ok and work_result.get("success", False) else {"build": None, "smoke_test": None, "ok": tests_ok}
+            fully_valid = bool(tests_ok and work_result.get("success", False) and android_validation.get("ok", True))
 
-            if tests_ok and work_result.get("success", False):
+            if fully_valid:
                 item.status = "done"
-                item.notes.append(f"Iteration {iteration_number}: work executed and tests passed")
+                item.notes.append(f"Iteration {iteration_number}: work executed and validation passed")
+                item.metadata.pop("last_failure_summary", None)
             else:
                 snapshot_manifest = work_result.get("snapshot_manifest")
                 if snapshot_manifest:
                     self._restore_snapshot(snapshot_manifest)
+
+                if not tests_ok:
+                    failure_summary = self._short_failure_summary(pytest_result)
+                elif android_validation.get("build") and android_validation["build"].get("returncode", 1) != 0:
+                    failure_summary = self._build_or_smoke_failure_summary(android_validation["build"], "Android build failed")
+                elif android_validation.get("smoke_test") and android_validation["smoke_test"].get("returncode", 1) != 0:
+                    failure_summary = self._build_or_smoke_failure_summary(android_validation["smoke_test"], "Android smoke test failed")
+                else:
+                    failure_summary = str(work_result.get("summary", "Work execution failed")).strip() or "Work execution failed"
+                item.metadata["last_failure_summary"] = failure_summary
 
                 if item.attempts >= max_repair_attempts:
                     item.status = "failed"
@@ -888,9 +1030,14 @@ class MultiAgentSystem:
                 else:
                     item.status = "pending"
                     item.notes.append(
-                        f"Iteration {iteration_number}: failed or tests did not pass; rolled back and returned to backlog"
+                        f"Iteration {iteration_number}: failed validation; rolled back and returned to backlog"
                     )
 
+            backlog = self.load_backlog()
+            for idx, candidate in enumerate(backlog):
+                if candidate.item_id == item.item_id:
+                    backlog[idx] = item
+                    break
             self.save_backlog(backlog)
 
             payload = {
@@ -903,8 +1050,12 @@ class MultiAgentSystem:
                     "details": result.details,
                 },
                 "tests_ok": tests_ok,
+                "android_validation": android_validation,
+                "validation_ok": fully_valid,
             }
             report_path = self.write_iteration_report(iteration_number, payload)
+            payload["report_path"] = str(report_path)
+
             self.ctx.add_artifact(
                 Artifact(
                     name=f"iteration_{iteration_number:03d}_report",
@@ -916,19 +1067,38 @@ class MultiAgentSystem:
             )
             summary["iterations"].append(payload)
 
+            self.save_run_state(
+                {
+                    "status": "running",
+                    "objective": objective,
+                    "current_iteration": iteration_number,
+                    "current_backlog_item": asdict(item),
+                    "last_iteration_report": str(report_path),
+                    "pending_admin_requests": [],
+                }
+            )
+
         if summary.get("status") not in {"paused_waiting_admin"}:
             summary["release"] = self.run_workflow("release")
-            if summary["release"].details.get("admin_gateway", {}).get("status") == "pending":
+            pending = self._pending_admin_requests()
+            if pending or summary["release"].details.get("admin_gateway", {}).get("status") == "pending":
                 summary["status"] = "paused_waiting_admin"
+                summary["pending_admin_requests"] = pending
             else:
                 summary["status"] = summary.get("status", "finished")
 
+        self.save_run_state(
+            {
+                "status": summary.get("status", "finished"),
+                "objective": objective,
+                "current_iteration": len(summary.get("iterations", [])),
+                "current_backlog_item": summary["iterations"][-1]["backlog_item"] if summary.get("iterations") else None,
+                "last_iteration_report": summary["iterations"][-1]["report_path"] if summary.get("iterations") else None,
+                "pending_admin_requests": summary.get("pending_admin_requests", self._pending_admin_requests()),
+            }
+        )
         return summary
 
-
-# =============================================================================
-# Project helpers
-# =============================================================================
 
 def ensure_directories(ctx: ExecutionContext) -> None:
     project_root = Path(ctx.project_root)
@@ -941,9 +1111,13 @@ def ensure_directories(ctx: ExecutionContext) -> None:
 
     extra_dirs = [
         ctx.get_setting("orchestration", "iteration_reports_dir", default="./artifacts/iterations"),
+        ctx.get_setting("orchestration", "plan_artifacts_dir", default="./artifacts/plans"),
         "./artifacts/admin/requests",
         "./artifacts/admin/responses",
         "./artifacts/snapshots",
+        "./artifacts/android",
+        "./scripts/android",
+        "./android",
     ]
     for rel in extra_dirs:
         directory = project_root / Path(rel)
@@ -984,10 +1158,6 @@ def make_context(project_root: Optional[str] = None, settings_override: Optional
     )
 
 
-# =============================================================================
-# CLI
-# =============================================================================
-
 def print_summary(results: Dict[str, Any]) -> None:
     print("\n=== MAS SUMMARY ===")
     for key, value in results.items():
@@ -999,6 +1169,132 @@ def print_summary(results: Dict[str, Any]) -> None:
             print(f"- {key}: {type(value).__name__}")
 
 
+def compile_app_spec_to_backlog(spec: Dict[str, Any]) -> List[BacklogItem]:
+    app_name = str(spec.get("app_name") or "Generated Android App").strip() or "Generated Android App"
+    features = list(spec.get("features") or [])
+    screens = list(spec.get("screens") or [])
+    data_models = list(spec.get("data_models") or [])
+    integrations = list(spec.get("integrations") or [])
+
+    items: List[BacklogItem] = [
+        BacklogItem(
+            item_id="spec-bootstrap-001",
+            title=f"Align project for {app_name}",
+            description=(
+                f"Update documentation, packaging metadata, and generated artifacts so the repo reflects the app spec for {app_name}."
+            ),
+            acceptance_criteria=[
+                "Project artifacts mention the target app name",
+                "Packaging metadata remains valid",
+                "Tests still pass",
+            ],
+            metadata={
+                "executor": "llm_patch",
+                "patch_target_hint": ["README.md", "buildozer.spec", "docs/ANDROID_BUILD.md"],
+            },
+        )
+    ]
+
+    for index, screen in enumerate(screens, start=1):
+        screen_name = str(screen.get("name") or f"Screen {index}").strip() or f"Screen {index}"
+        purpose = str(screen.get("purpose") or "support the requested workflow").strip()
+        items.append(
+            BacklogItem(
+                item_id=f"spec-screen-{index:03d}",
+                title=f"Implement {screen_name} screen flow",
+                description=f"Extend the Kivy app to support the {screen_name} screen so it can {purpose}.",
+                acceptance_criteria=[
+                    f"The UI exposes the {screen_name} flow",
+                    "The behavior is reflected in the Kivy adapter or use cases",
+                    "Tests still pass",
+                ],
+                metadata={
+                    "executor": "llm_patch",
+                    "patch_target_hint": ["app_frameworks/kivy_adapter.py", "app/use_cases/media_links.py"],
+                    "spec_context": screen,
+                },
+            )
+        )
+
+    for index, feature in enumerate(features, start=1):
+        if isinstance(feature, dict):
+            title = str(feature.get("name") or feature.get("title") or f"Feature {index}").strip() or f"Feature {index}"
+            description = str(feature.get("description") or feature.get("goal") or "Implement the requested feature.").strip()
+        else:
+            title = str(feature).strip() or f"Feature {index}"
+            description = f"Implement the feature: {title}."
+        items.append(
+            BacklogItem(
+                item_id=f"spec-feature-{index:03d}",
+                title=f"Implement feature: {title}",
+                description=description,
+                acceptance_criteria=[
+                    f"The feature '{title}' is implemented or scaffolded in the Kivy app",
+                    "Relevant code paths are updated consistently",
+                    "Tests still pass",
+                ],
+                metadata={
+                    "executor": "llm_patch",
+                    "patch_target_hint": ["app/use_cases/media_links.py", "app_frameworks/kivy_adapter.py", "README.md"],
+                    "spec_context": feature,
+                },
+            )
+        )
+
+    if data_models:
+        items.append(
+            BacklogItem(
+                item_id="spec-data-models-001",
+                title="Align data model layer to app spec",
+                description="Update domain and storage layers so the requested data models are represented in the codebase.",
+                acceptance_criteria=[
+                    "Requested data models are represented in the codebase or documented as scaffolding",
+                    "Storage/use-case layers stay coherent",
+                    "Tests still pass",
+                ],
+                metadata={
+                    "executor": "llm_patch",
+                    "patch_target_hint": ["app/domain/models.py", "app/services/storage.py", "app/use_cases/media_links.py"],
+                    "spec_context": data_models,
+                },
+            )
+        )
+
+    if integrations:
+        items.append(
+            BacklogItem(
+                item_id="spec-integrations-001",
+                title="Document and scaffold requested integrations",
+                description="Document requested external integrations and add safe scaffolding points where practical.",
+                acceptance_criteria=[
+                    "Requested integrations are documented",
+                    "Safe scaffolding points exist for future live wiring",
+                    "Tests still pass",
+                ],
+                metadata={
+                    "executor": "llm_patch",
+                    "patch_target_hint": ["README.md", ".env.example", "docs/ANDROID_BUILD.md"],
+                    "spec_context": integrations,
+                },
+            )
+        )
+
+    items.append(
+        BacklogItem(
+            item_id="spec-android-validation-001",
+            title="Validate Android packaging path for spec-driven build",
+            description="Run the packaging path for the current app spec and persist structured build artifacts.",
+            acceptance_criteria=[
+                "Android build command is runnable",
+                "Android build report is generated",
+                "The project is ready for smoke testing",
+            ],
+            metadata={"executor": "create_android_packaging_files"},
+        )
+    )
+    return items
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(argv or [])
     if not argv:
@@ -1008,6 +1304,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     project_root = "."
     dry_run = True
     autonomous = False
+    show_status = False
     objective = (
         "Autonomously develop a high-quality Android app in Python for saving, "
         "organizing, sharing, and accessing remote and local media links."
@@ -1015,6 +1312,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     approve_request_id: Optional[str] = None
     decision: Optional[str] = None
     note = ""
+    android_package = False
+    android_smoke_test = False
+    android_mode = "debug"
+    app_spec_path: Optional[str] = None
+    compile_spec_only = False
 
     i = 0
     while i < len(argv):
@@ -1028,12 +1330,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif arg == "--autonomous":
             autonomous = True
             i += 1
+        elif arg == "--status":
+            show_status = True
+            i += 1
         elif arg == "--objective" and i + 1 < len(argv):
             objective = argv[i + 1]
             i += 2
         elif arg == "--approve-request" and i + 1 < len(argv):
             approve_request_id = argv[i + 1]
             i += 2
+        elif arg == "--android-package":
+            android_package = True
+            i += 1
+        elif arg == "--android-smoke-test":
+            android_smoke_test = True
+            i += 1
+        elif arg == "--android-mode" and i + 1 < len(argv):
+            android_mode = argv[i + 1]
+            i += 2
+        elif arg == "--app-spec" and i + 1 < len(argv):
+            app_spec_path = argv[i + 1]
+            i += 2
+        elif arg == "--compile-spec":
+            compile_spec_only = True
+            i += 1
         elif arg == "--decision" and i + 1 < len(argv):
             decision = argv[i + 1].strip().lower()
             i += 2
@@ -1049,6 +1369,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         ensure_directories(ctx)
+        mas = MultiAgentSystem(ctx)
+
+        if app_spec_path:
+            spec_data = json.loads(ctx.resolve_path(app_spec_path).read_text(encoding="utf-8"))
+            backlog_items = compile_app_spec_to_backlog(spec_data)
+            mas.save_backlog(backlog_items)
+            ctx.write_json(ctx.get_setting("orchestration", "app_spec_file", default="./artifacts/app_spec.json"), spec_data)
+            if compile_spec_only:
+                print(json.dumps({"compiled": True, "backlog_items": len(backlog_items), "app_name": spec_data.get("app_name", "")}, indent=2))
+                return 0
+
+        if show_status:
+            print(json.dumps(mas.load_run_state(), indent=2))
+            return 0
+
+        if android_package:
+            result = ctx.tool_registry["android_build"].run(ctx, mode=android_mode, dry_run=dry_run)
+            print(json.dumps(result, indent=2))
+            return 0
+
+        if android_smoke_test:
+            result = ctx.tool_registry["android_smoke_test"].run(
+                ctx,
+                package_name=ctx.get_setting("android", "package_name", default="com.example.linksaver"),
+                dry_run=dry_run,
+            )
+            print(json.dumps(result, indent=2))
+            return 0
 
         if approve_request_id:
             if not callable(AUTONOMY_RECORD_ADMIN_RESPONSE):
@@ -1066,7 +1414,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(payload, indent=2))
             return 0
 
-        mas = MultiAgentSystem(ctx)
         if autonomous:
             results = mas.run_autonomous_development_loop(objective=objective)
         else:

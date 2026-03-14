@@ -34,7 +34,12 @@ orchestration:
   write_iteration_artifacts: true
   backlog_file: "./artifacts/backlog.json"
   iteration_reports_dir: "./artifacts/iterations"
+  plan_artifacts_dir: "./artifacts/plans"
+  run_state_file: "./artifacts/run_state.json"
   auto_run_tests: true
+  auto_build_android: false
+  auto_smoke_test_android: false
+  app_spec_file: "./artifacts/app_spec.json"
 
 runtime:
   dry_run: true
@@ -45,8 +50,12 @@ android:
   gradle_wrapper_path: "./gradlew"
   avd_name: "TestDevice34"
   package_name: "com.example.linksaver"
+  app_name: "LinkSaver"
   min_sdk: 26
   target_sdk: 34
+  build_artifacts_dir: "./artifacts/android"
+  google_services_json: "./android/google-services.json"
+  release_keystore_properties: "./android/keystore.properties"
 
 app:
   display_name: "LinkSaver"
@@ -59,7 +68,24 @@ backend:
   use_firestore: true
   use_storage: true
   use_auth: true
+  use_functions: true
+  use_analytics: true
+  use_crashlytics: true
   offline_cache_enabled: true
+
+billing:
+  enabled: true
+  provider: "google_play"
+  premium_subscription_id: "premium_monthly"
+  remove_ads_product_id: "remove_ads"
+
+ads:
+  enabled: true
+  provider: "admob"
+  banner_enabled: true
+  interstitial_enabled: false
+  rewarded_enabled: false
+  app_open_enabled: false
 
 paths:
   app_dir: "./app"

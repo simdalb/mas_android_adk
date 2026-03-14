@@ -7,6 +7,14 @@ import json
 from app.domain.models import MediaLink
 
 
+class DuplicateMediaLinkError(ValueError):
+    pass
+
+
+class InvalidMediaLinkError(ValueError):
+    pass
+
+
 class LocalMediaRepository:
     def __init__(self, path: str = "artifacts/media_links.json") -> None:
         self.path = Path(path)
@@ -23,15 +31,46 @@ class LocalMediaRepository:
             return []
 
     def load_all(self) -> List[MediaLink]:
-        return [MediaLink(**item) for item in self._safe_load_raw()]
+        items: List[MediaLink] = []
+        for item in self._safe_load_raw():
+            try:
+                items.append(MediaLink(**item))
+            except Exception:
+                continue
+        return items
 
     def save_all(self, links: List[MediaLink]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = [link.__dict__ for link in links]
         self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    def _normalize_title(self, value: str) -> str:
+        return value.strip().casefold()
+
+    def _normalize_url(self, value: str) -> str:
+        return value.strip()
+
+    def _validate(self, link: MediaLink) -> None:
+        if not link.title.strip():
+            raise InvalidMediaLinkError("Title is required.")
+        if not link.url.strip():
+            raise InvalidMediaLinkError("URL or local path is required.")
+
+    def _is_duplicate(self, link: MediaLink, items: List[MediaLink]) -> bool:
+        title = self._normalize_title(link.title)
+        url = self._normalize_url(link.url)
+        for item in items:
+            if item.link_id == link.link_id:
+                continue
+            if self._normalize_title(item.title) == title and self._normalize_url(item.url) == url:
+                return True
+        return False
+
     def add(self, link: MediaLink) -> MediaLink:
+        self._validate(link)
         links = self.load_all()
+        if self._is_duplicate(link, links):
+            raise DuplicateMediaLinkError("A link with the same title and URL already exists.")
         links.append(link)
         self.save_all(links)
         return link
@@ -43,7 +82,11 @@ class LocalMediaRepository:
         return None
 
     def update(self, updated_link: MediaLink) -> MediaLink:
+        self._validate(updated_link)
         links = self.load_all()
+        if self._is_duplicate(updated_link, links):
+            raise DuplicateMediaLinkError("A link with the same title and URL already exists.")
+
         replaced = False
         for idx, item in enumerate(links):
             if item.link_id == updated_link.link_id:

@@ -1,0 +1,44 @@
+{
+  "app_name": "LinkSaver Pro",
+  "package_name": "com.example.linksaver",
+  "screens": [
+    {"name": "Home", "purpose": "browse and search saved media links"},
+    {"name": "Editor", "purpose": "create and update media links with tags and descriptions"},
+    {"name": "Auth", "purpose": "sign in and restore a user's synchronized library"},
+    {"name": "Premium", "purpose": "show subscriptions, remove-ads purchase, and restore purchases"}
+  ],
+  "features": [
+    {"name": "Search", "description": "Search by title, URL, tags, and description"},
+    {"name": "Offline library", "description": "Persist saved links locally and prepare for future sync"},
+    {"name": "Cloud sync scaffold", "description": "Expose safe integration boundaries for Firebase Auth, Firestore, and Storage"},
+    {"name": "Monetization scaffold", "description": "Prepare app state for paid tier and ad suppression after purchase"}
+  ],
+  "data_models": [
+    {"name": "MediaLink", "fields": ["title", "url", "tags", "description", "is_local"]},
+    {"name": "UserProfile", "fields": ["user_id", "email", "display_name", "is_paid"]}
+  ],
+  "integrations": [
+    "firebase_auth",
+    "firestore",
+    "firebase_storage",
+    "analytics",
+    "crashlytics",
+    "google_play_billing",
+    "admob"
+  ],
+  "ads": {
+    "banner": true,
+    "interstitial": false,
+    "rewarded": false,
+    "app_open": false,
+    "disable_for_paid_users": true
+  },
+  "billing": {
+    "premium_subscription": "premium_monthly",
+    "remove_ads_product": "remove_ads"
+  },
+  "notes": [
+    "Kivy-only implementation",
+    "Real credentials and service files will be added later"
+  ]
+}

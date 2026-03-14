@@ -2,7 +2,11 @@ from pathlib import Path
 import tempfile
 
 from app.domain.models import MediaLink
-from app.services.storage import LocalMediaRepository
+from app.services.storage import (
+    DuplicateMediaLinkError,
+    InvalidMediaLinkError,
+    LocalMediaRepository,
+)
 
 
 def test_storage_crud_cycle():
@@ -33,3 +37,32 @@ def test_storage_crud_cycle():
         deleted = repo.delete(created.link_id)
         assert deleted is True
         assert repo.get(created.link_id) is None
+
+
+def test_storage_rejects_duplicate_title_and_url():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = LocalMediaRepository(path=str(Path(tmp) / "media_links.json"))
+        repo.add(MediaLink(title="Example", url="https://example.com"))
+
+        try:
+            repo.add(MediaLink(title=" Example ", url="https://example.com"))
+            assert False, "Expected DuplicateMediaLinkError"
+        except DuplicateMediaLinkError:
+            assert True
+
+
+def test_storage_rejects_missing_title_or_url():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = LocalMediaRepository(path=str(Path(tmp) / "media_links.json"))
+
+        try:
+            repo.add(MediaLink(title="", url="https://example.com"))
+            assert False, "Expected InvalidMediaLinkError"
+        except InvalidMediaLinkError:
+            assert True
+
+        try:
+            repo.add(MediaLink(title="Example", url=""))
+            assert False, "Expected InvalidMediaLinkError"
+        except InvalidMediaLinkError:
+            assert True

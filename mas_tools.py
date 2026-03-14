@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
 import json
+import os
 import subprocess
+import sys
 
 
 class ToolError(RuntimeError):
@@ -27,13 +29,15 @@ class SafeSubprocessTool(BaseTool):
 
         command = kwargs.get("command")
         cwd = kwargs.get("cwd", ctx.project_root)
+        env_overrides = kwargs.get("env") or {}
 
         if not command or not isinstance(command, list):
             raise ToolError("command must be a list")
 
-        executable_name = Path(command[0]).name
-        allowed = set(ctx.policies.get("allowed_subprocess_commands", []))
-        if executable_name not in allowed:
+        executable_name = Path(command[0]).name.lower()
+        executable_stem = Path(command[0]).stem.lower()
+        allowed = {str(item).lower() for item in ctx.policies.get("allowed_subprocess_commands", [])}
+        if executable_name not in allowed and executable_stem not in allowed:
             raise ToolError(f"command not allowed: {executable_name}")
 
         ok, reason = guardrail_check("subprocess", ctx, {"command": command, "cwd": cwd})
@@ -47,13 +51,9 @@ class SafeSubprocessTool(BaseTool):
                 "stderr": "",
             }
 
-        proc = subprocess.run(
-            command,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        env = os.environ.copy()
+        env.update({str(k): str(v) for k, v in env_overrides.items()})
+        proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False, env=env)
         return {
             "returncode": proc.returncode,
             "stdout": proc.stdout,
@@ -151,10 +151,9 @@ class DirectoryTreeTool(BaseTool):
             if depth > max_depth:
                 return
             for child in sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
-                rel = child.relative_to(root)
                 indent = "  " * depth
                 suffix = "/" if child.is_dir() else ""
-                lines.append(f"{indent}{rel.name}{suffix}")
+                lines.append(f"{indent}{child.name}{suffix}")
                 if child.is_dir():
                     walk(child, depth + 1)
 
@@ -245,6 +244,52 @@ class PytestRunnerTool(BaseTool):
         return SafeSubprocessTool().run(ctx, command=["pytest", *args], cwd=ctx.project_root)
 
 
+
+
+class AndroidPreflightTool(BaseTool):
+    name = "android_preflight"
+    description = "Runs the scripted Android preflight checks"
+
+    def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        script = Path(ctx.project_root) / "scripts" / "android" / "preflight_check.py"
+        if not script.exists():
+            raise ToolError("Android preflight script is missing")
+        command = [sys.executable, str(script), "--project-root", ctx.project_root]
+        return SafeSubprocessTool().run(ctx, command=command, cwd=ctx.project_root)
+
+
+class AndroidBuildTool(BaseTool):
+    name = "android_build"
+    description = "Runs the scripted Android packaging flow"
+
+    def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        mode = kwargs.get("mode", "debug")
+        script = Path(ctx.project_root) / "scripts" / "android" / "build_android.py"
+        if not script.exists():
+            raise ToolError("Android build script is missing")
+        command = [sys.executable, str(script), "--project-root", ctx.project_root, "--mode", mode]
+        if ctx.dry_run or kwargs.get("dry_run"):
+            command.append("--dry-run")
+        return SafeSubprocessTool().run(ctx, command=command, cwd=ctx.project_root)
+
+
+class AndroidSmokeTestTool(BaseTool):
+    name = "android_smoke_test"
+    description = "Runs the scripted Android adb smoke test flow"
+
+    def run(self, ctx, **kwargs: Any) -> Dict[str, Any]:
+        script = Path(ctx.project_root) / "scripts" / "android" / "smoke_test_android.py"
+        if not script.exists():
+            raise ToolError("Android smoke test script is missing")
+        command = [sys.executable, str(script), "--project-root", ctx.project_root]
+        if ctx.dry_run or kwargs.get("dry_run"):
+            command.append("--dry-run")
+        package_name = kwargs.get("package_name")
+        if package_name:
+            command.extend(["--package-name", package_name])
+        return SafeSubprocessTool().run(ctx, command=command, cwd=ctx.project_root)
+
+
 TOOL_REGISTRY = {
     "safe_subprocess": SafeSubprocessTool(),
     "file_read": FileReadTool(),
@@ -261,4 +306,7 @@ TOOL_REGISTRY = {
     "emulator_status": EmulatorStatusTool(),
     "internet_request": InternetRequestTool(),
     "pytest_runner": PytestRunnerTool(),
+    "android_preflight": AndroidPreflightTool(),
+    "android_build": AndroidBuildTool(),
+    "android_smoke_test": AndroidSmokeTestTool(),
 }

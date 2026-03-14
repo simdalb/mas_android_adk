@@ -49,6 +49,7 @@ def main() -> int:
     links = build_demo_links()
 
     print(f"Launching {config.display_name} with framework adapter: {adapter.name()}")
+    print("Integration readiness:", config.integration_status.summary())
 
     run_ui = os.environ.get("RUN_KIVY_UI", "").lower() in {"1", "true", "yes"}
     if run_ui and hasattr(adapter, "run_ui"):

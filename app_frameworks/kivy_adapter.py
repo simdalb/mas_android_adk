@@ -7,7 +7,9 @@ import webbrowser
 
 from app.adapters.framework import FrameworkAdapter
 from app.domain.models import MediaLink
+from app.services.integration_config import load_integration_status
 from app.services.storage import LocalMediaRepository
+from app.use_cases.media_links import MediaLinkUseCases
 
 
 class KivyAdapter(FrameworkAdapter):
@@ -15,10 +17,12 @@ class KivyAdapter(FrameworkAdapter):
         return "kivy"
 
     def build_home_screen_model(self, links: List[MediaLink]) -> Dict:
+        integrations = load_integration_status().summary()
         return {
             "framework": self.name(),
             "screen": "home",
             "header": "LinkSaver",
+            "integration_status": integrations,
             "items": [
                 {
                     "link_id": link.link_id,
@@ -54,11 +58,14 @@ class KivyAdapter(FrameworkAdapter):
             ) from exc
 
         repo = LocalMediaRepository()
+        use_cases = MediaLinkUseCases(repository=repo)
+        integrations = load_integration_status().summary()
 
         class LinkSaverApp(App):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
                 self.repo = repo
+                self.use_cases = use_cases
                 self.current_edit_id = None
                 self.search_query = ""
 
@@ -71,6 +78,18 @@ class KivyAdapter(FrameworkAdapter):
                     height=40,
                 )
                 self.root_layout.add_widget(header)
+
+                integration_label = Label(
+                    text=(
+                        "Integrations: "
+                        f"Firebase={'ready' if integrations['firebase']['configured'] else 'pending'}, "
+                        f"Billing={'ready' if integrations['billing']['configured'] else 'pending'}, "
+                        f"AdMob={'ready' if integrations['admob']['configured'] else 'pending'}"
+                    ),
+                    size_hint_y=None,
+                    height=30,
+                )
+                self.root_layout.add_widget(integration_label)
 
                 self.status_label = Label(
                     text="Ready",
@@ -125,6 +144,13 @@ class KivyAdapter(FrameworkAdapter):
                 button_row.add_widget(clear_button)
                 self.root_layout.add_widget(button_row)
 
+                hint_label = Label(
+                    text="Tip: duplicate title + URL combinations are blocked to keep your library tidy.",
+                    size_hint_y=None,
+                    height=34,
+                )
+                self.root_layout.add_widget(hint_label)
+
                 search_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=40, spacing=8)
                 self.search_input = TextInput(
                     hint_text="Search title, URL, description, or tags",
@@ -150,7 +176,7 @@ class KivyAdapter(FrameworkAdapter):
                 return [tag.strip() for tag in raw.split(",") if tag.strip()]
 
             def current_links(self) -> List[MediaLink]:
-                return self.repo.search(self.search_query)
+                return self.use_cases.search_links(self.search_query)
 
             def refresh_list(self) -> None:
                 self.list_grid.clear_widgets()
@@ -220,36 +246,36 @@ class KivyAdapter(FrameworkAdapter):
                 description = self.description_input.text.strip()
                 is_local = bool(self.local_checkbox.active)
 
-                if not title or not url:
-                    self.set_status("Title and URL/path are required.")
-                    return
-
                 if self.current_edit_id:
-                    existing = self.repo.get(self.current_edit_id)
+                    existing = self.use_cases.get_link(self.current_edit_id)
                     if existing is None:
                         self.set_status("Selected item no longer exists.")
                         self.current_edit_id = None
                         return
-                    updated = MediaLink(
+
+                    existing.title = title
+                    existing.url = url
+                    existing.tags = tags
+                    existing.is_local = is_local
+                    existing.description = description
+
+                    result = self.use_cases.update_link_safe(existing)
+                    if not result["ok"]:
+                        self.set_status(result["error"])
+                        return
+
+                    self.set_status("Link updated.")
+                else:
+                    result = self.use_cases.create_link_safe(
                         title=title,
                         url=url,
                         tags=tags,
                         is_local=is_local,
                         description=description,
-                        link_id=existing.link_id,
                     )
-                    self.repo.update(updated)
-                    self.set_status("Link updated.")
-                else:
-                    self.repo.add(
-                        MediaLink(
-                            title=title,
-                            url=url,
-                            tags=tags,
-                            is_local=is_local,
-                            description=description,
-                        )
-                    )
+                    if not result["ok"]:
+                        self.set_status(result["error"])
+                        return
                     self.set_status("Link added.")
 
                 self.on_clear_form(None)
@@ -264,7 +290,7 @@ class KivyAdapter(FrameworkAdapter):
                 self.local_checkbox.active = False
 
             def on_edit(self, link_id: str, _instance) -> None:
-                link = self.repo.get(link_id)
+                link = self.use_cases.get_link(link_id)
                 if link is None:
                     self.set_status("Link not found.")
                     self.refresh_list()
@@ -279,7 +305,7 @@ class KivyAdapter(FrameworkAdapter):
                 self.set_status(f"Editing: {link.title}")
 
             def on_delete(self, link_id: str, _instance) -> None:
-                deleted = self.repo.delete(link_id)
+                deleted = self.use_cases.delete_link(link_id)
                 if deleted:
                     self.set_status("Link deleted.")
                 else:

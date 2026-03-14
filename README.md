@@ -138,3 +138,59 @@ release packet generation from real artifacts
 
 
 ---
+
+## Android packaging and smoke testing
+
+The repo now includes a concrete Buildozer-based Android path for the Kivy adapter.
+
+Dry-run package build:
+
+```
+python mas_android_adk.py --android-package --android-mode debug
+```
+
+Real package build:
+
+```
+python mas_android_adk.py --real-run --android-package --android-mode debug
+```
+
+ADB smoke test:
+
+```
+python mas_android_adk.py --android-smoke-test
+```
+
+See `docs/ANDROID_BUILD.md` for details.
+
+
+## App spec compilation
+
+Compile an app spec into backlog items:
+
+```
+python mas_android_adk.py --app-spec examples/app_spec.example.json --compile-spec
+```
+
+Run autonomous mode against the compiled spec:
+
+```
+python mas_android_adk.py --app-spec examples/app_spec.example.json --autonomous
+```
+
+See `docs/APP_SPEC.md` for the schema and workflow.
+
+
+## Integration preflight
+
+Use `.env` for runtime IDs and `android/google-services.json` for the Firebase Android config.
+
+Run:
+
+```
+python scripts/android/preflight_check.py --project-root .
+```
+
+This writes `artifacts/android/android_preflight_report.json` and shows which tools, config files, or env values are still missing before a real Android build.
+
+See `docs/INTEGRATIONS.md`.
